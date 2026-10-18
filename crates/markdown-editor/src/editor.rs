@@ -2085,6 +2085,13 @@ impl Seg {
     }
 }
 
+/// The inline-figure placeholder character: a non-breaking space, shaped
+/// `n` times to reserve a figure's width in the line. Two bytes in UTF-8 —
+/// every `TextRun` covering it must use `NBSP.len()` as its length, since
+/// run lengths are byte lengths and platform text systems split the text
+/// at run boundaries (a length of 1 panics inside the second byte).
+const NBSP: &str = "\u{a0}";
+
 /// Everything `push_math_segs` needs to swap an untouched inline formula
 /// for its typeset figure: the shared cache, the line's typesetting
 /// parameters, and where to record placements for the paint pass.
@@ -2137,7 +2144,7 @@ fn push_math_segs(
                 let n = ((fig.width / ctx.nbsp_w).round() as usize).clamp(1, 400);
                 out.push(Seg {
                     buf: c.clone(),
-                    repl: Some("\u{a0}".repeat(n).into()),
+                    repl: Some(NBSP.repeat(n).into()),
                 });
                 ctx.placed.push((c.clone(), fig));
                 cur = c.end;
@@ -2996,9 +3003,9 @@ impl Element for EditorElement {
                     let probe = window
                         .text_system()
                         .shape_text(
-                            SharedString::from("\u{a0}"),
+                            SharedString::from(NBSP),
                             px(fs),
-                            &[run(&style, *kind, 0, accent, 1, None, false, false)],
+                            &[run(&style, *kind, 0, accent, NBSP.len(), None, false, false)],
                             None,
                             None,
                         )

@@ -39,3 +39,6 @@ omgkit-io = "=0.0.8"
 omgkit-chem = "=0.0.8"
 omgkit-core = "=0.0.8"
 ttf-parser = "0.21"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
