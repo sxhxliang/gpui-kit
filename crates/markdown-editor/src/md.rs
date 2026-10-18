@@ -751,7 +751,7 @@ impl Analyzer {
         // (comments, marks, links) loses its conceals inside a math span.
         let mskip = |o: usize| {
             out.flags[o] & CODE != 0
-                || matches!(out.lines[out.line_of(o)].1, Kind::Code | Kind::Table)
+                || matches!(out.lines[out.line_of(o)].1, Kind::Code)
         };
         let maths = math_spans(text, &mskip);
         let spans: Vec<Range<usize>> = maths.iter().map(|m| m.range.clone()).collect();
@@ -1560,6 +1560,17 @@ mod tests {
     }
 
     #[test]
+    fn math_detected_in_table_rows() {
+        // Table lines join math detection so grid cells can typeset
+        // `$...$` like prose lines do (the grid replaces the span with a
+        // figure; source mode reveals it on touch, as everywhere else).
+        let t = "| A | B |\n| - | - |\n| $x^2$ | $5 and $6 |\n\nprose $y$\n";
+        let a = Analyzer::new().analyze(t);
+        let contents: Vec<&str> = a.maths.iter().map(|m| &t[m.content.clone()]).collect();
+        assert_eq!(contents, ["x^2", "y"]);
+    }
+
+    #[test]
     fn math_money_and_escapes_are_literal() {
         for t in [
             "R$ 10 e $ 20",
@@ -1576,11 +1587,13 @@ mod tests {
     }
 
     #[test]
-    fn math_skips_code_and_tables() {
+    fn math_skips_code_but_not_tables() {
+        // Code (inline and fenced) never scans for math; table rows do,
+        // so grid cells typeset `$...$` like prose lines.
         let t = "`$x$` e $y$\n\n```\n$z$\n```\n| a | b |\n| - | - |\n| $w$ | q |\n";
         let a = Analyzer::new().analyze(t);
-        assert_eq!(a.maths.len(), 1, "{:?}", a.maths);
-        assert_eq!(&t[a.maths[0].content.clone()], "y");
+        let contents: Vec<&str> = a.maths.iter().map(|m| &t[m.content.clone()]).collect();
+        assert_eq!(contents, ["y", "w"]);
     }
 
     #[test]
