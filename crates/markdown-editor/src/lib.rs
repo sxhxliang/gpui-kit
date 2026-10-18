@@ -32,6 +32,11 @@
 //! div().child(MarkdownEditor::new(&state))
 //! ```
 //!
+//! The state defaults to the [`DARK`] palette and the editor paints no
+//! background of its own, so set the palette for your color scheme with
+//! `set_theme` at creation (and when it changes) — otherwise dark-palette
+//! text sits unreadable on a light window.
+//!
 //! Configuration lives on the state: `set_theme`, `set_fonts`,
 //! `set_text_width` (via `set_max_col`), `set_smart_quotes`,
 //! `set_focus_mode`, `set_raw_tables`, `set_dirs` (for relative image

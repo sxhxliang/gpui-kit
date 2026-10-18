@@ -5,8 +5,8 @@ use gpui_kit::{
     Subscription, Window, div,
 };
 
-use gpui_kit::component::{label::Label, v_flex};
-use gpui_markdown_editor::{Changed, MarkdownEditor, MarkdownEditorState};
+use gpui_kit::component::{ActiveTheme, Theme, label::Label, v_flex};
+use gpui_markdown_editor::{Changed, MarkdownEditor, MarkdownEditorState, DARK, LIGHT};
 
 const SAMPLE: &str = "\
 # Markdown Editor
@@ -84,6 +84,16 @@ pub struct MarkdownEditorStory {
     state: Entity<MarkdownEditorState>,
     bytes: usize,
     _subscription: Subscription,
+    _theme_subscription: Subscription,
+}
+
+/// The editor palette matching the app theme's current mode. The editor
+/// paints no background of its own (the host's shows through) and its
+/// state defaults to abstract's dark palette, so the host must sync the
+/// palette to its color scheme — dark text on a light window is
+/// unreadable otherwise.
+fn palette(cx: &App) -> gpui_markdown_editor::Palette {
+    if cx.theme().mode.is_dark() { DARK } else { LIGHT }
 }
 
 impl super::Story for MarkdownEditorStory {
@@ -111,8 +121,10 @@ impl MarkdownEditorStory {
         if !KEYS_BOUND.swap(true, Ordering::SeqCst) {
             gpui_markdown_editor::bind_keys(cx);
         }
+        let pal = palette(cx);
         let state = cx.new(|cx| {
             let mut ed = MarkdownEditorState::new(cx);
+            ed.set_theme(pal, cx);
             ed.set_text(SAMPLE.to_string(), cx);
             ed
         });
@@ -122,10 +134,15 @@ impl MarkdownEditorStory {
             this.bytes = state.read(cx).text().len();
             cx.notify();
         });
+        let _theme_subscription = cx.observe_global::<Theme>(|this, cx| {
+            let pal = palette(cx);
+            this.state.update(cx, |ed, cx| ed.set_theme(pal, cx));
+        });
         Self {
             state,
             bytes,
             _subscription,
+            _theme_subscription,
         }
     }
 }
