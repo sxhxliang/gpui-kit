@@ -959,7 +959,7 @@ struct NestedViewClass(Persistent<Object<'static>>);
 impl<'js> FromJs<'js> for NestedViewClass {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> JsResult<Self> {
         let class = value.as_object().ok_or_else(|| {
-            Exception::throw_type(ctx, "cx.new(Class, props) expects a View subclass")
+            js_error::type_error(ctx, "cx.new(Class, props) expects a View subclass")
         })?;
         Ok(Self(Persistent::save(ctx, class.clone())))
     }
@@ -1069,6 +1069,7 @@ mod dock_api;
 mod entity_api;
 pub(crate) mod host;
 mod host_modules;
+pub(crate) mod js_error;
 mod overlay;
 pub(crate) mod sandbox;
 mod scheduler;
@@ -1697,8 +1698,7 @@ impl ShellRuntime {
         // Resource limits belong to the sandbox policy, but only the engine
         // owns the runtime handle, so the policy hands out values and this is
         // where they are applied. A runaway script must not be able to hold the
-        // UI thread (§19.3).
-        js_runtime.set_memory_limit(sandbox::memory_limit_bytes());
+        // UI thread (§19.3). The heap is deliberately unbounded; see `sandbox`.
         js_runtime.set_max_stack_size(sandbox::max_stack_size_bytes());
         js_runtime.set_interrupt_handler(Some(Box::new(sandbox::interrupt_handler())));
 
@@ -2259,7 +2259,7 @@ impl ShellRuntime {
 
                 let default: Value = module.get("default")?;
                 let Some(class) = default.as_object() else {
-                    return Err(Exception::throw_message(
+                    return Err(js_error::error(
                         ctx,
                         "main.js must `export default` a class that extends View",
                     ));
@@ -2476,7 +2476,7 @@ impl ShellRuntime {
         props: Persistent<Value<'static>>,
     ) -> JsResult<u32> {
         let parent = scope::current_view().ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 "cx.new(Class, props) needs a current script view; call it from a \
                  view's init(), event handler or task",
@@ -2497,7 +2497,7 @@ impl ShellRuntime {
             scope::current_application_generation().or_else(|| provenance.application_generation());
         let token = self.next_nested_view_token.get();
         let next = token.checked_add(1).ok_or_else(|| {
-            Exception::throw_range(ctx, "the nested Entity token space is exhausted")
+            js_error::range_error(ctx, "the nested Entity token space is exhausted")
         })?;
         self.next_nested_view_token.set(next);
         self.pending_nested
@@ -2547,7 +2547,7 @@ impl ShellRuntime {
             .or(pending_create)
             .or_else(|| self.in_flight_nested.borrow().get(&token).cloned());
         if pending_release || provenance.as_ref().is_none_or(|owner| !owner.is_current()) {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "this Entity has been released and can no longer be updated",
             ));
@@ -2557,7 +2557,7 @@ impl ShellRuntime {
             .is_some_and(|alias| self.entities().view(alias.handle).is_none())
         {
             self.nested_view_handles.borrow_mut().remove(&token);
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "this Entity has been released and can no longer be updated",
             ));
@@ -2598,7 +2598,7 @@ impl ShellRuntime {
             .or(pending_create)
             .or_else(|| self.in_flight_nested.borrow().get(&token).cloned());
         if pending_release || provenance.as_ref().is_none_or(|owner| !owner.is_current()) {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "cx.notify(entity) expects a live Entity from the current application",
             ));
@@ -2608,7 +2608,7 @@ impl ShellRuntime {
             .is_some_and(|alias| self.entities().view(alias.handle).is_none())
         {
             self.nested_view_handles.borrow_mut().remove(&token);
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "cx.notify(entity) expects a live Entity from the current application",
             ));
@@ -2648,7 +2648,7 @@ impl ShellRuntime {
             .or(pending_create)
             .or_else(|| self.in_flight_nested.borrow().get(&token).cloned());
         if provenance.as_ref().is_none_or(|owner| !owner.is_current()) {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "this Entity has been released and can no longer be released",
             ));
@@ -3083,7 +3083,7 @@ impl ShellRuntime {
             return Ok(());
         }
         let update = update.as_function().ok_or_else(|| {
-            Exception::throw_type(ctx, "a nested view's update property must be a function")
+            js_error::type_error(ctx, "a nested view's update property must be a function")
         })?;
         update.call::<_, ()>((This(instance), props))
     }
@@ -3294,6 +3294,33 @@ impl ShellRuntime {
         // and every helper would need a second, list-only plumbing.
         scope::adopt(entry.registered_in);
 
+        // The rows' own handlers go into a callback generation of their own.
+        // A render's generation lives as long as its snapshot, which outlasts
+        // thousands of frames of scrolling; a batch is rebuilt on every one of
+        // them, so its handlers have to be retired with the frame instead.
+        // Only one generation can be open at a time, and a list described
+        // while one already is keeps refusing row handlers.
+        let recording = !self.callbacks.borrow().is_building();
+        let callback_generation = recording.then(|| self.callbacks.borrow_mut().begin());
+        struct Recording<'a> {
+            runtime: &'a ShellRuntime,
+            previous: bool,
+            open: bool,
+        }
+        impl Drop for Recording<'_> {
+            fn drop(&mut self) {
+                self.runtime.interactive_inline_layout.set(self.previous);
+                if self.open {
+                    self.runtime.callbacks.borrow_mut().abort();
+                }
+            }
+        }
+        let mut recording = Recording {
+            runtime: self,
+            previous: self.interactive_inline_layout.replace(recording),
+            open: recording,
+        };
+
         let outer = std::mem::take(&mut *self.arena.borrow_mut());
         let described = self.with_js(|ctx| {
             let handler = entry.value.clone().restore(ctx)?;
@@ -3304,7 +3331,7 @@ impl ShellRuntime {
             let produced: Value =
                 handler.call((payload, context_object(ctx, ContextBinding::Call(generation))?))?;
             let items = produced.into_array().ok_or_else(|| {
-                Exception::throw_type(
+                js_error::type_error(
                     ctx,
                     "a virtual list's item renderer must return an array of elements, one per                      item in the range it was given",
                 )
@@ -3315,13 +3342,13 @@ impl ShellRuntime {
             }
             let mut keys = Vec::new();
             keys.try_reserve_exact(range.len()).map_err(|_| {
-                Exception::throw_range(ctx, "the virtual list item-key table could not be allocated")
+                js_error::range_error(ctx, "the virtual list item-key table could not be allocated")
             })?;
             let mut unique = HashSet::new();
             for index in range.clone() {
                 let key: String = key_handler.call((index,))?;
                 if !unique.insert(key.clone()) {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         &format!("virtual list get_key returned duplicate key `{key}` in one visible range"),
                     ));
@@ -3333,12 +3360,106 @@ impl ShellRuntime {
         let arena = std::mem::replace(&mut *self.arena.borrow_mut(), outer);
 
         match described {
-            Ok((roots, keys)) => Some(crate::spec::ItemSpecs::new(arena, roots, keys)),
+            Ok((roots, keys)) => match callback_generation {
+                Some(generation) if self.callbacks.borrow().has_staged() => {
+                    self.callbacks.borrow_mut().commit();
+                    recording.open = false;
+                    let snapshot = RenderSnapshot::new(
+                        self,
+                        generation,
+                        roots.first().copied().unwrap_or_default(),
+                        arena,
+                        entry.application.clone(),
+                        entry.view.clone(),
+                    );
+                    Some(crate::spec::ItemSpecs::recorded(snapshot, roots, keys))
+                }
+                _ => Some(crate::spec::ItemSpecs::new(arena, roots, keys)),
+            },
             Err(error) => {
                 tracing::error!("error in virtual list item renderer: {error}");
                 None
             }
         }
+    }
+
+    /// Asks a lazy list's `get_key` for the keys of items by index, from
+    /// inside layout.
+    ///
+    /// What a `list` keeps the reader's place by when its item count changes:
+    /// it remembers the key of the item at the top of the viewport after each
+    /// layout and, once the count has changed, asks for keys around that
+    /// item's old index until it finds where the key went. `ask` is handed the
+    /// lookup and decides how far to go. Once `get_key` throws, every later
+    /// lookup answers `None` without calling it, and the error is logged.
+    ///
+    /// The scope is the item renderer's, for the same reasons: this runs from
+    /// GPUI's layout pass, so [`ScopePhase::Layout`] forbids `cx.notify()` and
+    /// retained state, and nothing is drained afterwards.
+    pub(crate) fn item_keys<R>(
+        self: &Rc<Self>,
+        get_key: CallbackId,
+        window: &mut Window,
+        cx: &mut App,
+        ask: impl FnOnce(&mut dyn FnMut(usize) -> Option<String>) -> R,
+    ) -> Option<R> {
+        let entry = self.callbacks.borrow().get(get_key)?;
+
+        if entry
+            .application
+            .as_ref()
+            .is_some_and(|application| !application.is_active())
+        {
+            tracing::debug!("item key resolver {get_key} belongs to a retired application");
+            return None;
+        }
+
+        let view = entry.live_view()?;
+        let policy = view
+            .as_ref()
+            .map(|view| view.read(cx).policy())
+            .unwrap_or_else(crate::policy::default);
+
+        self.metrics.time_frame_script(|| {
+            let (_guard, _) = scope::enter_with_application(
+                self,
+                window,
+                cx,
+                ScopePhase::Layout,
+                view,
+                policy,
+                entry.application.clone(),
+            );
+            scope::adopt(entry.registered_in);
+
+            let answered = self.with_js(|ctx| {
+                let key_handler = entry.value.clone().restore(ctx)?;
+                let mut failure = None;
+                let answer = ask(&mut |index| {
+                    if failure.is_some() {
+                        return None;
+                    }
+                    match key_handler.call::<_, String>((index,)) {
+                        Ok(key) => Some(key),
+                        Err(error) => {
+                            failure = Some(error);
+                            None
+                        }
+                    }
+                });
+                match failure {
+                    Some(error) => Err(error),
+                    None => Ok(answer),
+                }
+            });
+            match answered {
+                Ok(answer) => Some(answer),
+                Err(error) => {
+                    tracing::error!("error in a list's get_key: {error}");
+                    None
+                }
+            }
+        })
     }
 
     /// Draws one piece of a dock's chrome.
@@ -3436,7 +3557,7 @@ impl ShellRuntime {
         view_type: ViewType,
     ) -> JsResult<String> {
         let policy = scope::current_policy().ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 "DockArea.register_panel(name, Class) needs a live host call; call it from                  init() or an event handler",
             )
@@ -3452,7 +3573,7 @@ impl ShellRuntime {
             crate::dock::register_panel(&application, panel, script.clone(), cx)
         })
         .ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 "DockArea.register_panel(name, Class) needs a live host call; call it from                  init() or an event handler",
             )
@@ -3665,8 +3786,27 @@ impl ShellRuntime {
         });
     }
 
-    /// The lifetime checks, scope entry and job drain every row-level dispatch
-    /// shares. The call itself is the caller's, because the two row events
+    /// Reports which items a `list` shows, and how many it has, after a layout
+    /// changed either. Called after the frame rather than from inside it, so
+    /// the handler runs as an event handler does and may change state.
+    pub(crate) fn dispatch_visible_range(
+        self: &Rc<Self>,
+        id: CallbackId,
+        range: std::ops::Range<usize>,
+        count: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.dispatch_item(id, "visible range", window, cx, |ctx, handler, context| {
+            let payload = Object::new(ctx.clone())?;
+            payload.set("start", range.start)?;
+            payload.set("end", range.end)?;
+            handler.call::<_, ()>((payload, count, context))
+        });
+    }
+
+    /// The lifetime checks, scope entry and job drain every list-level
+    /// dispatch shares. The call itself is the caller's, because the events
     /// hand the handler different argument lists.
     fn dispatch_item(
         self: &Rc<Self>,
@@ -4689,7 +4829,7 @@ impl ShellRuntime {
             } else if let Some(value) = value.as_string() {
                 Ok(ComponentCallbackValue::String(value.to_string()?))
             } else {
-                Err(Exception::throw_type(
+                Err(js_error::type_error(
                     &ctx,
                     "component callbacks may only return null, boolean, finite number, or string",
                 ))
@@ -5016,9 +5156,9 @@ impl ShellRuntime {
             let prepare_theme: Function = ctx.globals().get("__prepare_theme")?;
             prepare_theme.call::<_, ()>(())?;
             let instance = object.value.clone().restore(ctx)?;
-            let render: Function = instance.get("render").map_err(|_| {
-                Exception::throw_message(ctx, "view class has no render(cx) method")
-            })?;
+            let render: Function = instance
+                .get("render")
+                .map_err(|_| js_error::error(ctx, "view class has no render(cx) method"))?;
             let produced: Value = render.call((
                 This(instance),
                 context_object(ctx, ContextBinding::Call(generation))?,
@@ -5097,7 +5237,7 @@ impl ShellRuntime {
             "cell_active_style" => "cell_active_style",
             "caret_style" => "caret_style",
             other => {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     &format!(
                         "unknown state style `{other}`; expected hover, active, focus, \
@@ -5111,7 +5251,7 @@ impl ShellRuntime {
         self.arena
             .borrow_mut()
             .claim(node)
-            .map_err(|error| Exception::throw_type(ctx, &error.to_string()))?;
+            .map_err(|error| js_error::type_error(ctx, &error.to_string()))?;
         self.push_op_checked(ctx, self.push_op(id, SpecOp::StateStyle(interned, node)))?;
         Ok(node)
     }
@@ -5139,7 +5279,7 @@ impl ShellRuntime {
             "decrement_button" => "decrement_button",
             "increment_button" => "increment_button",
             other => {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     &format!("unknown element slot `{other}`"),
                 ));
@@ -5149,7 +5289,7 @@ impl ShellRuntime {
         self.arena
             .borrow_mut()
             .claim(element)
-            .map_err(|error| Exception::throw_type(ctx, &error.to_string()))?;
+            .map_err(|error| js_error::type_error(ctx, &error.to_string()))?;
         self.push_op_checked(ctx, self.push_op(id, SpecOp::Slot(interned, element)))
     }
 
@@ -5399,7 +5539,7 @@ impl Resolver for AppModules {
         _attributes: Option<ImportAttributes<'js>>,
     ) -> JsResult<String> {
         let Some(application) = self.application_for_base(base) else {
-            return Err(Exception::throw_message(
+            return Err(js_error::error(
                 ctx,
                 &format!("cannot identify the application importing `{name}` from `{base}`"),
             ));
@@ -5411,7 +5551,7 @@ impl Resolver for AppModules {
             // and "this binary is older than the script it is loading" — and
             // the second is what a moved module looks like from here.
             if name == crate::DEFAULT_COMPONENT_MODULE {
-                return Err(Exception::throw_message(
+                return Err(js_error::error(
                     ctx,
                     &format!(
                         "cannot resolve module `{name}`: this runtime has no component \
@@ -5422,7 +5562,7 @@ impl Resolver for AppModules {
                 ));
             }
             if !name.starts_with('.') && !name.contains('/') {
-                return Err(Exception::throw_message(
+                return Err(js_error::error(
                     ctx,
                     &format!(
                         "cannot resolve module `{name}`: this runtime's built-in modules are {}, \
@@ -5433,14 +5573,14 @@ impl Resolver for AppModules {
                     ),
                 ));
             }
-            return Err(Exception::throw_message(
+            return Err(js_error::error(
                 ctx,
                 &format!("cannot resolve module `{name}` from `{base}`"),
             ));
         };
 
         if !path.starts_with(&boundary) {
-            return Err(Exception::throw_message(
+            return Err(js_error::error(
                 ctx,
                 &format!(
                     "module `{name}` resolves outside the application directory `{}`",
@@ -5466,7 +5606,7 @@ impl Loader for AppModules {
     ) -> JsResult<Module<'js, Declared>> {
         let path = Self::untag(name);
         let source = read_module_source(Path::new(path))
-            .map_err(|error| Exception::throw_message(ctx, &error.to_string()))?;
+            .map_err(|error| js_error::error(ctx, &error.to_string()))?;
         declare_app_module(ctx, name, source)
     }
 }
@@ -6134,7 +6274,8 @@ globalThis.__gpui = (() => {
   });
 
   // The multi-line state shares almost all of its surface with the single-line
-  // one, and adds the three calls that only mean anything once text can wrap.
+  // one, and adds the calls that only mean anything once text has more than
+  // one line.
   const textareaState = (handle) => ({
     ...tokenStateMethods(handle, __textarea_token_call),
     __handle: handle,
@@ -6149,6 +6290,7 @@ globalThis.__gpui = (() => {
         oneBased(max_rows, "set_auto_grow(min_rows, max_rows) max_rows"),
       ),
     set_soft_wrap: (wrap) => __textarea_set_soft_wrap(handle, Boolean(wrap)),
+    set_submit_on_enter: (submit) => __textarea_set_submit_on_enter(handle, Boolean(submit)),
     release: () => __textarea_release(handle),
   });
 
@@ -6705,6 +6847,10 @@ globalThis.__gpui = (() => {
       check();
       return __open_url(String(url));
     },
+    open_path: (path) => {
+      check();
+      return __open_path(String(path));
+    },
     read_from_clipboard: () => {
       check();
       return __clipboard_read_text();
@@ -7143,6 +7289,7 @@ impl ShellRuntime {
                 "keep_mounted",
                 "on_item_click",
                 "on_item_secondary_click",
+                "on_visible_range_change",
                 "on_change",
                 "token",
                 "on_token_click",
@@ -7186,6 +7333,7 @@ impl ShellRuntime {
                 "default_open",
                 "overlay_closable",
                 "with_item_to_measure_index",
+                "with_follow_mode",
             ]
             .into_iter()
             .enumerate()
@@ -7219,13 +7367,13 @@ impl ShellRuntime {
                 Func::from(move |ctx: Ctx<'_>, module: String, name: String, id: String, props: host_modules::Argument| -> JsResult<SpecId> {
                     let props = props.0;
                     if id.is_empty() {
-                        return Err(Exception::throw_type(&ctx, "a component needs a non-empty string id"));
+                        return Err(js_error::type_error(&ctx, "a component needs a non-empty string id"));
                     }
                     let registry = crate::host_modules::modules();
                     registry
                         .get(&module)
                         .and_then(|found| found.resolve_component(&name))
-                        .map_err(|error| Exception::throw_message(&ctx, error.message()))?;
+                        .map_err(|error| js_error::error(&ctx, error.message()))?;
                     Ok(upgrade(&component_runtime, &ctx)?.push_node(Component::Module(
                         crate::spec::ModuleComponentSpec {
                             module: module.into(),
@@ -7245,7 +7393,7 @@ impl ShellRuntime {
                     let format = match format.as_str() {
                         "html" => crate::spec::TextViewFormat::Html,
                         "markdown" => crate::spec::TextViewFormat::Markdown,
-                        _ => return Err(Exception::throw_type(&ctx, "TextView format must be html or markdown")),
+                        _ => return Err(js_error::type_error(&ctx, "TextView format must be html or markdown")),
                     };
                     Ok(upgrade(&text_view_runtime, &ctx)?.push_node(Component::TextView(
                         crate::spec::TextViewSpec {
@@ -7310,74 +7458,16 @@ impl ShellRuntime {
                           width: f64|
                           -> JsResult<SpecId> {
                         if !width.is_finite() || width < 0.0 {
-                            return Err(Exception::throw_type(
+                            return Err(js_error::type_error(
                                 &ctx,
                                 "path stroke width must be finite and non-negative",
                             ));
                         }
-                        if !opacity.is_finite() || opacity < 0.0 {
-                            return Err(Exception::throw_type(
-                                &ctx,
-                                "path background opacity must be finite and non-negative",
-                            ));
-                        }
-                        let value_count =
-                            crate::engine::quickjs::host_modules::bridge_array_len(&ctx, &values)?;
-                        let mut value_strings = Vec::new();
-                        value_strings.try_reserve_exact(value_count).map_err(|_| {
-                            Exception::throw_range(&ctx, "path background values are too large")
-                        })?;
-                        for index in 0..value_count {
-                            value_strings.push(values.get::<String>(index)?);
-                        }
-                        let number = |index: usize, name: &str| -> JsResult<f32> {
-                            value_strings
-                                .get(index)
-                                .and_then(|value| value.parse::<f32>().ok())
-                                .filter(|value| value.is_finite())
-                                .ok_or_else(|| Exception::throw_type(&ctx, name))
-                        };
-                        let text = |index: usize, name: &str| -> JsResult<String> {
-                            value_strings
-                                .get(index)
-                                .cloned()
-                                .ok_or_else(|| Exception::throw_type(&ctx, name))
-                        };
-                        let kind = match kind.as_str() {
-                            "solid" => crate::spec::BackgroundKind::Solid {
-                                color: text(0, "solid background needs a color")?,
-                            },
-                            "linear-gradient" => crate::spec::BackgroundKind::LinearGradient {
-                                angle: number(0, "gradient angle must be finite")?,
-                                from: (
-                                    text(1, "gradient needs a from color")?,
-                                    number(2, "gradient from percentage must be finite")?,
-                                ),
-                                to: (
-                                    text(3, "gradient needs a to color")?,
-                                    number(4, "gradient to percentage must be finite")?,
-                                ),
-                                color_space,
-                            },
-                            "pattern-slash" => crate::spec::BackgroundKind::PatternSlash {
-                                color: text(0, "slash pattern needs a color")?,
-                                width: number(1, "slash pattern width must be finite")?,
-                                interval: number(2, "slash pattern interval must be finite")?,
-                            },
-                            "checkerboard" => crate::spec::BackgroundKind::Checkerboard {
-                                color: text(0, "checkerboard needs a color")?,
-                                size: number(1, "checkerboard size must be finite")?,
-                            },
-                            _ => {
-                                return Err(Exception::throw_type(&ctx, "unknown Background kind"));
-                            }
-                        };
+                        let background =
+                            background_spec(&ctx, &kind, &values, opacity, color_space)?;
                         Ok(upgrade(&path_runtime, &ctx)?.push_node(Component::Path {
                             fill,
-                            background: crate::spec::BackgroundSpec {
-                                kind,
-                                opacity: opacity as f32,
-                            },
+                            background,
                             stroke_width: width as f32,
                         }))
                     },
@@ -7519,7 +7609,7 @@ impl ShellRuntime {
                           -> JsResult<SpecId> {
                         let store = upgrade(&date_picker_runtime, &ctx)?;
                         if store.entities().focus(handle).is_none() {
-                            return Err(Exception::throw_type(
+                            return Err(js_error::type_error(
                                 &ctx,
                                 "the focus handle given to DatePicker.new(id, focus_handle) has \
                                  been released; a date picker takes the keyboard through that \
@@ -7575,7 +7665,7 @@ impl ShellRuntime {
                     if runtime.pending_nested.borrow().iter().any(|operation| {
                         matches!(operation, PendingNestedOperation::Release { token: candidate, .. } if *candidate == token)
                     }) {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             &ctx,
                             "this Entity has been released and can no longer be mounted",
                         ));
@@ -7587,7 +7677,7 @@ impl ShellRuntime {
                         .filter(|alias| alias.provenance.is_current())
                         .map(|alias| alias.handle)
                         .ok_or_else(|| {
-                            Exception::throw_type(
+                            js_error::type_error(
                                 &ctx,
                                 "this Entity has been released and can no longer be mounted",
                             )
@@ -7595,7 +7685,7 @@ impl ShellRuntime {
                     // Resolve and clone before borrowing the arena. The
                     // snapshot keeps this entity alive after handle release.
                     let view = { runtime.entities().view(handle) }.ok_or_else(|| {
-                        Exception::throw_type(
+                        js_error::type_error(
                             &ctx,
                             "this Entity has been released and can no longer be mounted",
                         )
@@ -7604,7 +7694,7 @@ impl ShellRuntime {
                         .arena
                         .borrow_mut()
                         .push_child_view(ChildViewSpec::new(handle, view))
-                        .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))
+                        .map_err(|error| js_error::type_error(&ctx, &error.to_string()))
                 }),
             )?;
 
@@ -7621,7 +7711,7 @@ impl ShellRuntime {
             globals.set(
                 "__unknown",
                 Func::from(|ctx: Ctx<'_>, name: String| -> JsResult<()> {
-                    Err(Exception::throw_type(&ctx, &unknown_method(&name)))
+                    Err(js_error::type_error(&ctx, &unknown_method(&name)))
                 }),
             )?;
 
@@ -7750,17 +7840,17 @@ impl ShellRuntime {
                     let method = method.clone();
                     component_module.set(format!("{}.{}", descriptor.export(), method.name()), Func::from(move |ctx: Ctx<'_>, proof: String, handle: u64, arguments: PlainDataArguments| -> JsResult<DataResult> {
                         let runtime = upgrade(&method_runtime, &ctx)?;
-                        if proof != runtime.component_state_proof { return Err(Exception::throw_type(&ctx, "state belongs to another runtime")); }
+                        if proof != runtime.component_state_proof { return Err(js_error::type_error(&ctx, "state belongs to another runtime")); }
                         if !method.is_readonly() && matches!(scope::current_phase(), Some(ScopePhase::Render | ScopePhase::Layout)) {
-                            return Err(Exception::throw_type(&ctx, "state cannot be changed during render or layout"));
+                            return Err(js_error::type_error(&ctx, "state cannot be changed during render or layout"));
                         }
                         runtime.flush_component_state_releases();
                         let call = {
-                            let store = runtime.component_states.try_borrow().map_err(|_| Exception::throw_type(&ctx, "state registry is already borrowed"))?;
+                            let store = runtime.component_states.try_borrow().map_err(|_| js_error::type_error(&ctx, "state registry is already borrowed"))?;
                             method.prepare(&store, handle, kind, arguments.0).map_err(|e| state_operation_error(&ctx, e))?
                         };
                         scope::with_current(move |window, cx| call(window, cx))
-                            .ok_or_else(|| Exception::throw_type(&ctx, "state operation requires a live host call"))?
+                            .ok_or_else(|| js_error::type_error(&ctx, "state operation requires a live host call"))?
                             .map(DataResult).map_err(|e| state_operation_error(&ctx, e))
                     }))?;
                 }
@@ -7768,6 +7858,26 @@ impl ShellRuntime {
                     &component_module,
                     runtime.clone(),
                     descriptor.clone(),
+                )?;
+                let release_runtime = runtime.clone();
+                let kind = descriptor.kind();
+                component_module.set(
+                    format!("{}.release", descriptor.export()),
+                    Func::from(move |ctx: Ctx<'_>, proof: String, handle: u64| -> JsResult<bool> {
+                        let runtime = upgrade(&release_runtime, &ctx)?;
+                        if proof != runtime.component_state_proof {
+                            return Err(js_error::type_error(&ctx, "state belongs to another runtime"));
+                        }
+                        if matches!(scope::current_phase(), Some(ScopePhase::Render | ScopePhase::Layout)) {
+                            return Err(js_error::type_error(&ctx, "state cannot be released during render or layout"));
+                        }
+                        runtime.flush_component_state_releases();
+                        let mut states = runtime
+                            .component_states
+                            .try_borrow_mut()
+                            .map_err(|_| js_error::type_error(&ctx, "state registry is already borrowed"))?;
+                        Ok(states.remove(handle, kind))
+                    }),
                 )?;
                 let state_runtime = runtime.clone();
                 let descriptor = descriptor.clone();
@@ -7840,7 +7950,7 @@ impl ShellRuntime {
                 && !matches!(component(id), Some(Component::Resizable(..)))
         };
         if orphan {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "resizable_panel() belongs to an h_resizable() or v_resizable(): its size \
                  and its drag handle are the group's. Use a div() here instead",
@@ -7864,9 +7974,10 @@ impl ShellRuntime {
         value: Option<StyleArgument>,
     ) -> JsResult<()> {
         let name = style::param_style_at(index)
-            .ok_or_else(|| Exception::throw_type(ctx, "unknown element method"))?;
+            .ok_or_else(|| js_error::type_error(ctx, "unknown element method"))?;
         let value = match value {
             Some(StyleArgument::Value(value)) => value,
+            Some(StyleArgument::Object(saved)) => bridge_style(ctx, name, &saved.restore(ctx)?)?,
             // The value is not known yet, so neither is whether it is valid.
             // A placeholder is recorded, the position is noted, and the same
             // `style::apply_param` check runs at instantiation with the real
@@ -7877,7 +7988,7 @@ impl ShellRuntime {
                 return self.record_slot_at_last_op(ctx, id, 0, argument);
             }
             Some(StyleArgument::Handler) => {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     &format!("`{name}` does not take a function"),
                 ));
@@ -7887,7 +7998,7 @@ impl ShellRuntime {
             None => {
                 let error = style::apply_param(name, &[], Default::default())
                     .expect_err("a parametric style without its argument is refused");
-                return Err(Exception::throw_type(ctx, error.message()));
+                return Err(js_error::type_error(ctx, error.message()));
             }
         };
 
@@ -7895,7 +8006,7 @@ impl ShellRuntime {
         // Validate eagerly so a bad argument reports at the call site instead
         // of surfacing during materialize.
         style::apply_param(name, &args, Default::default())
-            .map_err(|error| Exception::throw_type(ctx, error.message()))?;
+            .map_err(|error| js_error::type_error(ctx, error.message()))?;
         self.push_op_checked(ctx, self.push_op(id, SpecOp::ParamStyle(name, args)))
     }
 
@@ -7906,7 +8017,7 @@ impl ShellRuntime {
         // path would reject the sentinel as neither a value nor a function.
         if let Some((position, argument)) = args.first_slot() {
             if self.is_registered_component(id) {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     &format!(
                         "`{method}` cannot take a template argument yet; registered component methods are validated when their values are recorded"
@@ -7938,13 +8049,13 @@ impl ShellRuntime {
             && self.is_registered_component(id)
             && registered_method.is_none()
         {
-            return Err(Exception::throw_type(ctx, &unknown_method(method)));
+            return Err(js_error::type_error(ctx, &unknown_method(method)));
         }
         if registered_common_behavior && let Some(descriptor) = registered_method.as_ref() {
             self.arena
                 .borrow()
                 .check_live(id)
-                .map_err(|error| Exception::throw_type(ctx, &error.to_string()))?;
+                .map_err(|error| js_error::type_error(ctx, &error.to_string()))?;
             let mut callback = None;
             self.component_payload_transaction(
                 ctx,
@@ -7962,7 +8073,7 @@ impl ShellRuntime {
             )?;
             if method == "on_click" {
                 let callback = callback.ok_or_else(|| {
-                    Exception::throw_type(
+                    js_error::type_error(
                         ctx,
                         "on_click descriptor must declare exactly one callback argument",
                     )
@@ -7977,7 +8088,7 @@ impl ShellRuntime {
             self.arena
                 .borrow()
                 .check_live(id)
-                .map_err(|error| Exception::throw_type(ctx, &error.to_string()))?;
+                .map_err(|error| js_error::type_error(ctx, &error.to_string()))?;
             let payload = self.component_payload_transaction(
                 ctx,
                 descriptor.name(),
@@ -8000,7 +8111,7 @@ impl ShellRuntime {
             && !registered_common_behavior
             && !registered_common_slot
         {
-            return Err(Exception::throw_type(ctx, &unknown_method(method)));
+            return Err(js_error::type_error(ctx, &unknown_method(method)));
         }
 
         match method {
@@ -8008,9 +8119,8 @@ impl ShellRuntime {
                 let child = args
                     .first_value()
                     .and_then(|value| value.as_f32().ok())
-                    .ok_or_else(|| {
-                        Exception::throw_type(ctx, "child(element) expects an element")
-                    })? as SpecId;
+                    .ok_or_else(|| js_error::type_error(ctx, "child(element) expects an element"))?
+                    as SpecId;
                 self.attach(ctx, id, child)
             }
             "content" | "trigger" | "input" | "decrement_button" | "increment_button" | "image"
@@ -8019,7 +8129,7 @@ impl ShellRuntime {
                     .first_value()
                     .and_then(|value| value.as_f32().ok())
                     .ok_or_else(|| {
-                        Exception::throw_type(ctx, &format!("{method}(element) expects an element"))
+                        js_error::type_error(ctx, &format!("{method}(element) expects an element"))
                     })? as SpecId;
                 self.fill_slot(ctx, id, method, element)
             }
@@ -8030,7 +8140,7 @@ impl ShellRuntime {
                 if scope::current_phase() == Some(ScopePhase::Layout)
                     && !self.interactive_inline_layout.get()
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         "`on_action` cannot be registered from a virtual list's item \
                          renderer: the rows are rebuilt every frame, so a handler \
@@ -8042,14 +8152,14 @@ impl ShellRuntime {
                     .and_then(|value| value.as_str().ok().map(str::to_owned))
                     .filter(|action| !action.is_empty())
                     .ok_or_else(|| {
-                        Exception::throw_type(
+                        js_error::type_error(
                             ctx,
                             "on_action(action, handler) expects the action's name first, \
                              as a non-empty string",
                         )
                     })?;
                 let saved = args.handler_at(1).ok_or_else(|| {
-                    Exception::throw_type(
+                    js_error::type_error(
                         ctx,
                         "on_action(action, handler) expects a function second",
                     )
@@ -8073,7 +8183,7 @@ impl ShellRuntime {
                 if scope::current_phase() == Some(ScopePhase::Layout)
                     && !self.interactive_inline_layout.get()
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         &format!(
                             "`{method}` cannot be registered from a virtual list's item \
@@ -8086,7 +8196,7 @@ impl ShellRuntime {
                     .first_value()
                     .and_then(|value| value.as_str().ok().map(str::to_owned))
                     .ok_or_else(|| {
-                        Exception::throw_type(
+                        js_error::type_error(
                             ctx,
                             &format!(
                                 "{method}(button, handler) expects a button first: \
@@ -8095,7 +8205,7 @@ impl ShellRuntime {
                         )
                     })?;
                 let saved = args.handler_at(1).ok_or_else(|| {
-                    Exception::throw_type(
+                    js_error::type_error(
                         ctx,
                         &format!("{method}(button, handler) expects a function second"),
                     )
@@ -8108,7 +8218,7 @@ impl ShellRuntime {
                     ("on_mouse_up", "right") => "on_mouse_up_right",
                     ("on_mouse_up", "middle") => "on_mouse_up_middle",
                     (_, other) => {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             ctx,
                             &format!(
                                 "`{other}` is not a mouse button; \
@@ -8138,6 +8248,7 @@ impl ShellRuntime {
             | "on_step"
             | "on_item_click"
             | "on_item_secondary_click"
+            | "on_visible_range_change"
             | "on_mouse_move"
             | "on_hover"
             | "on_key_down"
@@ -8150,34 +8261,32 @@ impl ShellRuntime {
             | "empty_group"
             | "drop_indicator"
             | "dock" => {
-                // A handler registered from inside a virtual list's item
-                // renderer has nowhere to live. Callbacks belong to the
-                // snapshot that registered them and are retired with it; the
-                // snapshot outlives thousands of frames, while the rows are
-                // rebuilt on every one — so twenty handlers a frame would
-                // accumulate, unreachable and unreleased, for as long as the
-                // description stood. Refused where it was written rather than
-                // leaked quietly. `on_item_click` on the list is the one
-                // handler that covers the rows, and it is registered from
-                // `render()` like every other.
+                // Layout code with no handler lifetime of its own — a dock's
+                // chrome, or a list batch reached while another generation is
+                // being recorded — has nowhere to put a handler. Callbacks
+                // belong to the snapshot that registered them; a render's
+                // snapshot outlives thousands of frames while layout code runs
+                // on every one, so they would accumulate, unreachable and
+                // unreleased. Refused where it was written rather than leaked
+                // quietly. A list's item renderer normally records into a
+                // generation of its own batch and does not reach this.
                 if scope::current_phase() == Some(ScopePhase::Layout)
                     && !self.interactive_inline_layout.get()
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         &format!(
-                            "`{method}` cannot be registered from a virtual list's item \
-                             renderer: the rows are rebuilt every frame, so a handler \
-                             registered there would pile up for as long as the view stood. \
-                             Use `on_item_click((key, cx) => ...)` or \
-                             `on_item_secondary_click((key, event, cx) => ...)` on the list \
-                             itself, and read the row out of your own data with the stable key \
-                             it gives you"
+                            "`{method}` cannot be registered here: this renderer runs during \
+                             layout with no handler lifetime of its own, so a handler \
+                             registered from it would pile up for as long as the view stood. \
+                             Register it from render(), or on a virtual list use \
+                             `on_item_click((key, cx) => ...)` and read the row out of your \
+                             own data with the key it gives you"
                         ),
                     ));
                 }
                 let saved = args.first_handler().ok_or_else(|| {
-                    Exception::throw_type(ctx, &format!("{method}(handler) expects a function"))
+                    js_error::type_error(ctx, &format!("{method}(handler) expects a function"))
                 })?;
                 let callback = self.callbacks.borrow_mut().push(CallbackEntry {
                     value: saved,
@@ -8202,6 +8311,7 @@ impl ShellRuntime {
             | "track_focus"
             | "track_scroll"
             | "with_item_to_measure_index"
+            | "with_follow_mode"
             | "content_focus_handle"
             | "key_context"
             | "aria_level"
@@ -8256,6 +8366,7 @@ impl ShellRuntime {
                     "track_focus" => "track_focus",
                     "track_scroll" => "track_scroll",
                     "with_item_to_measure_index" => "with_item_to_measure_index",
+                    "with_follow_mode" => "with_follow_mode",
                     "content_focus_handle" => "content_focus_handle",
                     "key_context" => "key_context",
                     "aria_level" => "aria_level",
@@ -8303,7 +8414,7 @@ impl ShellRuntime {
                         .and_then(|value| value.as_str().ok())
                         .is_none()
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         "id(name) expects a string; it is the element's stable identity, so it \
                          must not change between renders",
@@ -8318,17 +8429,30 @@ impl ShellRuntime {
                         .and_then(|value| value.as_str().ok())
                         .is_none()
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         "tooltip(text) expects a string; a tooltip built from an element is not \
                          bound yet",
+                    ));
+                }
+                // Anything else would leave the list in whichever mode it was
+                // in, with nothing on screen to say why it is not following.
+                if name == "with_follow_mode"
+                    && !matches!(
+                        bridged.first().and_then(|value| value.as_str().ok()),
+                        Some("normal" | "tail")
+                    )
+                {
+                    return Err(js_error::type_error(
+                        ctx,
+                        r#"with_follow_mode(mode) expects "normal" or "tail""#,
                     ));
                 }
                 // A bar that silently sits at zero because the percentage
                 // arrived as a string is the kind of bug that gets blamed on
                 // the layout. Say it at the call site instead.
                 if name == "value" && bridged.first().and_then(finite_number).is_none() {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         "value(percent) expects a number between 0 and 100",
                     ));
@@ -8338,7 +8462,7 @@ impl ShellRuntime {
                     let size = bridged.get(1).and_then(finite_whole_number);
                     if !matches!((position, size), (Some(position), Some(size)) if position >= 1.0 && size >= position && size <= usize::MAX as f32)
                     {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             ctx,
                             "set_position(position, size) expects whole finite numbers with 1 <= position <= size",
                         ));
@@ -8346,14 +8470,14 @@ impl ShellRuntime {
                 }
                 if name == "size_range" {
                     let Some(min) = bridged.first().and_then(finite_number) else {
-                        return Err(Exception::throw_range(
+                        return Err(js_error::range_error(
                             ctx,
                             "size_range minimum does not fit the native pixel range",
                         ));
                     };
                     let max = match bridged.get(1) {
                         Some(value) => Some(finite_number(value).ok_or_else(|| {
-                            Exception::throw_range(
+                            js_error::range_error(
                                 ctx,
                                 "size_range maximum does not fit the native pixel range",
                             )
@@ -8361,7 +8485,7 @@ impl ShellRuntime {
                         None => None,
                     };
                     if max.is_some_and(|max| max < min) {
-                        return Err(Exception::throw_range(
+                        return Err(js_error::range_error(
                             ctx,
                             "size_range maximum must be greater than or equal to its minimum",
                         ));
@@ -8373,7 +8497,7 @@ impl ShellRuntime {
                         .and_then(finite_whole_number)
                         .is_some_and(|count| count >= 0.0 && count <= usize::MAX as f32)
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         &format!("{name}(count) expects a non-negative whole finite number"),
                     ));
@@ -8384,13 +8508,13 @@ impl ShellRuntime {
                 // role" is not the answer to a script that asked for it.
                 if name == "role" {
                     let Some(named) = bridged.first().and_then(|value| value.as_str().ok()) else {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             ctx,
                             "role(name) expects a string; see the Role type in gpui-kit.d.ts",
                         ));
                     };
                     if named == crate::a11y::FILTERED_ROLE {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             ctx,
                             "role(\"generic_container\") announces nothing: GPUI filters that \
                              role out of the accessibility tree. Leave the role off instead, \
@@ -8398,7 +8522,7 @@ impl ShellRuntime {
                         ));
                     }
                     if crate::a11y::role_from_name(named).is_none() {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             ctx,
                             &format!(
                                 "unknown accessibility role `{named}`; the names mirror \
@@ -8416,17 +8540,17 @@ impl ShellRuntime {
                         .and_then(|value| value.as_f32().ok())
                         .is_some_and(|index| index.fract() == 0.0)
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         "tab_index(index) expects a whole number",
                     ));
                 }
                 if name == "href" {
                     let Some(target) = bridged.first().and_then(|value| value.as_str().ok()) else {
-                        return Err(Exception::throw_type(ctx, "href(url) expects a string"));
+                        return Err(js_error::type_error(ctx, "href(url) expects a string"));
                     };
                     if !is_openable_url(target) {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             ctx,
                             "href(url) expects an absolute HTTP(S) URL with a host",
                         ));
@@ -8456,7 +8580,7 @@ impl ShellRuntime {
                     .and_then(|value| value.as_f32().ok())
                     .is_some_and(|handle| handle >= 0.0)
                 {
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         ctx,
                         &format!(
                             "{name}(...) expects the group or dock its chrome handler was given as its first argument"
@@ -8489,11 +8613,11 @@ impl ShellRuntime {
                     // Validate eagerly so a bad argument reports at the call
                     // site instead of surfacing during materialize.
                     style::apply_param(name, &bridged, Default::default())
-                        .map_err(|error| Exception::throw_type(ctx, error.message()))?;
+                        .map_err(|error| js_error::type_error(ctx, error.message()))?;
                     return self
                         .push_op_checked(ctx, self.push_op(id, SpecOp::ParamStyle(name, bridged)));
                 }
-                Err(Exception::throw_type(ctx, &unknown_method(method)))
+                Err(js_error::type_error(ctx, &unknown_method(method)))
             }
         }
     }
@@ -8553,7 +8677,7 @@ impl ShellRuntime {
         arguments: &Arguments,
     ) -> JsResult<Vec<ComponentArgument>> {
         if arguments.0.len() > descriptors.len() {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 &format!(
                     "{api}(...) expects at most {} argument{}",
@@ -8594,18 +8718,17 @@ impl ShellRuntime {
                 .copied()
                 .find(|element| !unique.insert(*element))
             {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     &format!("{api}(...) cannot consume element {duplicate} twice"),
                 ));
             }
-            let payload =
-                factory(&arguments).map_err(|error| Exception::throw_type(ctx, &error))?;
+            let payload = factory(&arguments).map_err(|error| js_error::type_error(ctx, &error))?;
             for element in element_ids {
                 self.arena
                     .borrow_mut()
                     .claim(element)
-                    .map_err(|error| Exception::throw_type(ctx, &error.to_string()))?;
+                    .map_err(|error| js_error::type_error(ctx, &error.to_string()))?;
             }
             Ok(payload)
         })();
@@ -8635,20 +8758,20 @@ impl ShellRuntime {
                 descriptor.create(&arguments, window, cx)
             })
             .ok_or_else(|| {
-                Exception::throw_type(
+                js_error::type_error(
                     ctx,
                     "retained component state can only be created during a live Window/App call",
                 )
             })?
-            .map_err(|error| Exception::throw_type(ctx, &error))?;
+            .map_err(|error| js_error::type_error(ctx, &error))?;
             let owner = scope::current_application_generation();
             self.component_states
                 .try_borrow_mut()
                 .map_err(|_| {
-                    Exception::throw_type(ctx, "retained component state is already borrowed")
+                    js_error::type_error(ctx, "retained component state is already borrowed")
                 })?
                 .insert(descriptor.kind(), owner, state)
-                .map_err(|error| Exception::throw_range(ctx, &error))
+                .map_err(|error| js_error::range_error(ctx, &error))
         })();
         if result.is_err() {
             self.callbacks.borrow_mut().rollback_to(callback_checkpoint);
@@ -8673,7 +8796,7 @@ impl ShellRuntime {
             };
         }
         let argument = argument.ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 &format!(
                     "{api}({}) expects {}",
@@ -8715,7 +8838,7 @@ impl ShellRuntime {
                 self.arena
                     .borrow()
                     .ensure_claimable(*id)
-                    .map_err(|error| Exception::throw_type(ctx, &error.to_string()))?;
+                    .map_err(|error| js_error::type_error(ctx, &error.to_string()))?;
                 Some(ComponentArgument::Element(*id))
             }
             // A `gpui-base` state and a registered one can share a kind name —
@@ -8724,7 +8847,7 @@ impl ShellRuntime {
             (ArgumentSchema::Entity(kind), Argument::Entity(_))
                 if self.components.states().any(|state| state.kind() == *kind) =>
             {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     &format!(
                         "{api}({name}) expects the {kind} from {module:?}, created with \
@@ -8748,7 +8871,7 @@ impl ShellRuntime {
                     self.component_states
                         .try_borrow()
                         .map_err(|_| {
-                            Exception::throw_type(
+                            js_error::type_error(
                                 ctx,
                                 "retained component state is already mutably borrowed",
                             )
@@ -8789,7 +8912,7 @@ impl ShellRuntime {
             _ => None,
         };
         validated.ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 &format!("{api}({name}) expects {}", schema_name(schema)),
             )
@@ -8801,7 +8924,7 @@ impl ShellRuntime {
         ctx: &Ctx<'_>,
         result: Result<(), E>,
     ) -> JsResult<()> {
-        result.map_err(|error| Exception::throw_type(ctx, &error.to_string()))
+        result.map_err(|error| js_error::type_error(ctx, &error.to_string()))
     }
 }
 
@@ -8882,10 +9005,10 @@ impl<'js> FromJs<'js> for ItemExtents {
             return Ok(Self::Uniform(uniform));
         }
         let items = value.as_array().ok_or_else(|| {
-            Exception::throw_type(ctx, "item_sizes must be a number or an array of numbers")
+            js_error::type_error(ctx, "item_sizes must be a number or an array of numbers")
         })?;
         let length = host_modules::bridge_array_len(ctx, &items).map_err(|_| {
-            Exception::throw_range(
+            js_error::range_error(
                 ctx,
                 &format!(
                     "item_sizes may contain at most {} entries",
@@ -8895,7 +9018,7 @@ impl<'js> FromJs<'js> for ItemExtents {
         })?;
         let mut extents = Vec::new();
         extents.try_reserve_exact(length).map_err(|_| {
-            Exception::throw_range(ctx, "the item_sizes array could not be allocated")
+            js_error::range_error(ctx, "the item_sizes array could not be allocated")
         })?;
         for extent in items.iter::<f64>() {
             extents.push(extent?);
@@ -8914,7 +9037,7 @@ struct ItemRenderer(Persistent<Function<'static>>);
 impl<'js> FromJs<'js> for ItemRenderer {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> JsResult<Self> {
         let function = value.as_function().ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 "a virtual list needs a render function; it is called with the visible range,                  not once per item",
             )
@@ -8929,7 +9052,7 @@ struct ItemKeyResolver(Persistent<Function<'static>>);
 impl<'js> FromJs<'js> for ItemKeyResolver {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> JsResult<Self> {
         let function = value.as_function().ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 "a virtual list needs get_key(index) to return each item's stable string key",
             )
@@ -8961,7 +9084,7 @@ fn guard_lazy_list(
     count: usize,
 ) -> JsResult<Rc<ShellRuntime>> {
     if scope::current_phase() == Some(ScopePhase::Layout) {
-        return Err(Exception::throw_type(
+        return Err(js_error::type_error(
             ctx,
             "a list cannot be built from inside another list's item renderer: its own \
              renderer would belong to no render pass and would never be called. Describe \
@@ -8974,7 +9097,7 @@ fn guard_lazy_list(
         .borrow_mut()
         .claim_virtual_items(count, MAX_VIRTUAL_ITEMS_PER_RENDER)
     {
-        return Err(Exception::throw_type(
+        return Err(js_error::type_error(
             ctx,
             &format!(
                 "the lists in one render may describe at most \
@@ -9029,7 +9152,7 @@ fn virtual_list_constructor(
 
                 let extent = |value: f64| -> JsResult<gpui::Size<gpui::Pixels>> {
                     if !value.is_finite() || value < 0.0 {
-                        return Err(Exception::throw_type(
+                        return Err(js_error::type_error(
                             &ctx,
                             "every item size must be a finite, non-negative number of pixels",
                         ));
@@ -9046,7 +9169,7 @@ fn virtual_list_constructor(
 
                 let reserve = |values: &mut Vec<gpui::Size<gpui::Pixels>>| {
                     values.try_reserve_exact(count).map_err(|_| {
-                        Exception::throw_range(
+                        js_error::range_error(
                             &ctx,
                             "the virtual list's native size table could not be allocated",
                         )
@@ -9062,7 +9185,7 @@ fn virtual_list_constructor(
                     }
                     ItemExtents::PerItem(values) => {
                         if values.len() != count {
-                            return Err(Exception::throw_type(
+                            return Err(js_error::type_error(
                                 &ctx,
                                 &format!(
                                     "this list was given {} item sizes for {count} items; pass                                      one number for a uniform extent, or one per item",
@@ -9142,7 +9265,7 @@ fn element_id(ctx: &Ctx<'_>, value: &Value<'_>) -> JsResult<SpecId> {
         return make.call((value.get::<String>()?,));
     }
     let Some(object) = value.as_object() else {
-        return Err(Exception::throw_type(
+        return Err(js_error::type_error(
             ctx,
             "render(cx) must return an element, an Entity, or a string",
         ));
@@ -9159,7 +9282,7 @@ fn element_id(ctx: &Ctx<'_>, value: &Value<'_>) -> JsResult<SpecId> {
         .as_object()
         .and_then(|object| object.get::<_, u32>("__id").ok())
         .ok_or_else(|| {
-            Exception::throw_type(
+            js_error::type_error(
                 ctx,
                 "render(cx) must return an element, an Entity, or a string",
             )
@@ -9227,16 +9350,16 @@ fn component_data_from_js<'js>(
     budget: &mut ComponentDataBudget,
 ) -> JsResult<ComponentDataValue> {
     if depth > MAX_COMPONENT_DATA_DEPTH {
-        return Err(Exception::throw_range(
+        return Err(js_error::range_error(
             ctx,
             "component delegate data is nested too deeply",
         ));
     }
     budget.nodes = budget.nodes.checked_add(1).ok_or_else(|| {
-        Exception::throw_range(ctx, "component delegate data contains too many values")
+        js_error::range_error(ctx, "component delegate data contains too many values")
     })?;
     if budget.nodes > MAX_COMPONENT_DATA_NODES {
-        return Err(Exception::throw_range(
+        return Err(js_error::range_error(
             ctx,
             "component delegate data contains too many values",
         ));
@@ -9249,7 +9372,7 @@ fn component_data_from_js<'js>(
     }
     if let Some(v) = value.as_number() {
         if !v.is_finite() {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "component delegate numbers must be finite",
             ));
@@ -9260,7 +9383,7 @@ fn component_data_from_js<'js>(
         let v = v.to_string()?;
         budget.string_bytes = budget.string_bytes.saturating_add(v.len());
         if budget.string_bytes > MAX_COMPONENT_DATA_STRING_BYTES {
-            return Err(Exception::throw_range(
+            return Err(js_error::range_error(
                 ctx,
                 "component delegate strings exceed the byte limit",
             ));
@@ -9268,13 +9391,13 @@ fn component_data_from_js<'js>(
         return Ok(ComponentDataValue::String(v));
     }
     if value.as_function().is_some() {
-        return Err(Exception::throw_type(
+        return Err(js_error::type_error(
             ctx,
             "component delegate data cannot contain functions",
         ));
     }
     if value.is_promise() {
-        return Err(Exception::throw_type(
+        return Err(js_error::type_error(
             ctx,
             "component delegate data cannot contain promises",
         ));
@@ -9283,7 +9406,7 @@ fn component_data_from_js<'js>(
         let len = host_modules::bridge_array_len(ctx, &array)?;
         let mut out = Vec::new();
         out.try_reserve_exact(len)
-            .map_err(|_| Exception::throw_range(ctx, "component delegate array is too large"))?;
+            .map_err(|_| js_error::range_error(ctx, "component delegate array is too large"))?;
         for ix in 0..len {
             out.push(component_data_from_js(
                 ctx,
@@ -9300,7 +9423,7 @@ fn component_data_from_js<'js>(
         let prototype: Value = get_prototype.call((object.clone(),))?;
         let ordinary_prototype: Value = object_constructor.get("prototype")?;
         if !prototype.is_null() && prototype != ordinary_prototype {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "component delegate objects must have Object.prototype or null prototype",
             ));
@@ -9308,7 +9431,7 @@ fn component_data_from_js<'js>(
         let get_symbols: Function = object_constructor.get("getOwnPropertySymbols")?;
         let symbols: Array = get_symbols.call((object.clone(),))?;
         if host_modules::bridge_array_len(ctx, &symbols)? != 0 {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 ctx,
                 "component delegate objects cannot contain symbol keys",
             ));
@@ -9319,7 +9442,7 @@ fn component_data_from_js<'js>(
         for key in object.keys::<String>() {
             budget.keys += 1;
             if budget.keys > MAX_COMPONENT_DATA_OBJECT_KEYS {
-                return Err(Exception::throw_range(
+                return Err(js_error::range_error(
                     ctx,
                     "component delegate objects contain too many keys",
                 ));
@@ -9327,7 +9450,7 @@ fn component_data_from_js<'js>(
             let key = key?;
             budget.string_bytes = budget.string_bytes.saturating_add(key.len());
             if budget.string_bytes > MAX_COMPONENT_DATA_STRING_BYTES {
-                return Err(Exception::throw_range(
+                return Err(js_error::range_error(
                     ctx,
                     "component delegate strings exceed the byte limit",
                 ));
@@ -9336,13 +9459,13 @@ fn component_data_from_js<'js>(
             let getter: Value = descriptor.get("get")?;
             let setter: Value = descriptor.get("set")?;
             if !getter.is_undefined() || !setter.is_undefined() {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     "component delegate objects cannot contain accessors",
                 ));
             }
             if matches!(key.as_str(), "__id" | "__handle" | "__componentStateHandle") {
-                return Err(Exception::throw_type(
+                return Err(js_error::type_error(
                     ctx,
                     "component delegate data cannot contain shell handles or elements",
                 ));
@@ -9352,7 +9475,7 @@ fn component_data_from_js<'js>(
         }
         return Ok(ComponentDataValue::Object(out));
     }
-    Err(Exception::throw_type(
+    Err(js_error::type_error(
         ctx,
         "component delegate callbacks may return only plain data",
     ))
@@ -9419,9 +9542,9 @@ impl ContextBinding {
     fn with_app<R>(self, ctx: &Ctx<'_>, body: impl FnOnce(&mut App) -> R) -> JsResult<R> {
         match self {
             Self::Call(generation) => scope::with_context(generation, |_, app| body(app))
-                .map_err(|error| Exception::throw_type(ctx, &error.to_string())),
+                .map_err(|error| js_error::type_error(ctx, &error.to_string())),
             Self::Ambient => scope::with_current_app(body).ok_or_else(|| {
-                Exception::throw_type(
+                js_error::type_error(
                     ctx,
                     "this cx has no host call to speak for. An async cx works inside the task \
                      that owns it — from a handler the scheduler resumed — not from a bare \
@@ -9445,7 +9568,7 @@ fn pagination_items<'js>(
 ) -> JsResult<Array<'js>> {
     let clamp = |value: f64| -> JsResult<usize> {
         if !value.is_finite() || value < 0.0 {
-            return Err(Exception::throw_type(
+            return Err(js_error::type_error(
                 &ctx,
                 "pagination_items(current_page, total_pages, visible_pages?) expects \
                  non-negative numbers",
@@ -9640,7 +9763,7 @@ fn context_object<'js>(ctx: &Ctx<'js>, binding: ContextBinding) -> JsResult<Obje
                     } else {
                         "cx.notify()"
                     };
-                    return Err(Exception::throw_type(
+                    return Err(js_error::type_error(
                         &ctx,
                         &format!(
                             "{api} is not allowed during the `{}` phase; \
@@ -9656,14 +9779,14 @@ fn context_object<'js>(ctx: &Ctx<'js>, binding: ContextBinding) -> JsResult<Obje
                     Some(value) if value.is_undefined() => None,
                     Some(value) => {
                         let object = value.as_object().ok_or_else(|| {
-                            Exception::throw_type(&ctx, "cx.notify(entity) expects an Entity")
+                            js_error::type_error(&ctx, "cx.notify(entity) expects an Entity")
                         })?;
                         let branded = object.get::<_, bool>("__entity").unwrap_or(false);
                         let token = object.get::<_, u32>("__handle").map_err(|_| {
-                            Exception::throw_type(&ctx, "cx.notify(entity) expects an Entity")
+                            js_error::type_error(&ctx, "cx.notify(entity) expects an Entity")
                         })?;
                         if !branded {
-                            return Err(Exception::throw_type(
+                            return Err(js_error::type_error(
                                 &ctx,
                                 "cx.notify(entity) expects an Entity",
                             ));
@@ -9677,7 +9800,7 @@ fn context_object<'js>(ctx: &Ctx<'js>, binding: ContextBinding) -> JsResult<Obje
                         None => current,
                         Some(token) => {
                             let current = current.as_ref().ok_or_else(|| {
-                                Exception::throw_type(
+                                js_error::type_error(
                                     &notify_ctx,
                                     "cx.notify(entity) requires a current script view",
                                 )
@@ -9770,7 +9893,7 @@ impl<'js> FromJs<'js> for PlainDataArguments {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> JsResult<Self> {
         match component_data_from_js(ctx, value, 0, &mut ComponentDataBudget::default())? {
             ComponentDataValue::Array(values) => Ok(Self(values)),
-            _ => Err(Exception::throw_type(
+            _ => Err(js_error::type_error(
                 ctx,
                 "state operation expects an argument array",
             )),
@@ -9790,7 +9913,7 @@ fn state_operation_error(ctx: &Ctx<'_>, error: anyhow::Error) -> rquickjs::Error
             return exception.throw();
         }
     }
-    Exception::throw_type(ctx, &error.to_string())
+    js_error::type_error(ctx, &error.to_string())
 }
 
 struct Arguments(SmallVec<[Argument; 2]>);
@@ -9807,6 +9930,10 @@ enum StyleArgument {
     Handler,
     /// A template's sentinel. See [`Argument::Slot`].
     Slot(u16),
+    /// An object or an array, kept to be read once the style is known: what
+    /// one means depends on the method (`shadow` reads an array of records,
+    /// `bg` a `Background`), and `FromJs` runs before the name is in hand.
+    Object(Persistent<Value<'static>>),
 }
 
 impl<'js> FromJs<'js> for StyleArgument {
@@ -9814,8 +9941,11 @@ impl<'js> FromJs<'js> for StyleArgument {
         if value.as_function().is_some() {
             return Ok(Self::Handler);
         }
-        if let Some(slot) = slot_index(&value) {
-            return Ok(Self::Slot(slot));
+        if value.as_object().is_some() {
+            if let Some(slot) = slot_index(&value) {
+                return Ok(Self::Slot(slot));
+            }
+            return Ok(Self::Object(Persistent::save(ctx, value)));
         }
         Ok(Self::Value(bridge(ctx, &value)?))
     }
@@ -9834,10 +9964,220 @@ fn slot_index(value: &Value<'_>) -> Option<u16> {
     (index.is_finite() && index >= 0.0 && index <= f64::from(u16::MAX)).then_some(index as u16)
 }
 
+/// Rebuilds a `Background` from the flattened form the prelude's
+/// `background(...)` builder holds: a kind, its values as strings, an opacity
+/// factor and a colour space.
+///
+/// The one parser for that form, shared by `window.paint_path` (which receives
+/// the pieces as arguments) and the `bg` style (which receives the frozen
+/// object and reads them off it), so a `Background` means the same thing
+/// wherever it is handed over. Colours are kept as written and checked when
+/// the value is used.
+fn background_spec(
+    ctx: &Ctx<'_>,
+    kind: &str,
+    values: &Array<'_>,
+    opacity: f64,
+    color_space: String,
+) -> JsResult<crate::spec::BackgroundSpec> {
+    use crate::spec::BackgroundKind;
+
+    if !opacity.is_finite() || opacity < 0.0 {
+        return Err(js_error::type_error(
+            ctx,
+            "background opacity must be finite and non-negative",
+        ));
+    }
+    let value_count = host_modules::bridge_array_len(ctx, values)?;
+    let mut value_strings = Vec::new();
+    value_strings
+        .try_reserve_exact(value_count)
+        .map_err(|_| js_error::range_error(ctx, "background values are too large"))?;
+    for index in 0..value_count {
+        value_strings.push(values.get::<String>(index)?);
+    }
+    let number = |index: usize, name: &str| -> JsResult<f32> {
+        value_strings
+            .get(index)
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| js_error::type_error(ctx, name))
+    };
+    let text = |index: usize, name: &str| -> JsResult<String> {
+        value_strings
+            .get(index)
+            .cloned()
+            .ok_or_else(|| js_error::type_error(ctx, name))
+    };
+    let kind = match kind {
+        "solid" => BackgroundKind::Solid {
+            color: text(0, "solid background needs a color")?,
+        },
+        "linear-gradient" => BackgroundKind::LinearGradient {
+            angle: number(0, "gradient angle must be finite")?,
+            from: (
+                text(1, "gradient needs a from color")?,
+                number(2, "gradient from percentage must be finite")?,
+            ),
+            to: (
+                text(3, "gradient needs a to color")?,
+                number(4, "gradient to percentage must be finite")?,
+            ),
+            color_space,
+        },
+        "pattern-slash" => BackgroundKind::PatternSlash {
+            color: text(0, "slash pattern needs a color")?,
+            width: number(1, "slash pattern width must be finite")?,
+            interval: number(2, "slash pattern interval must be finite")?,
+        },
+        "checkerboard" => BackgroundKind::Checkerboard {
+            color: text(0, "checkerboard needs a color")?,
+            size: number(1, "checkerboard size must be finite")?,
+        },
+        _ => return Err(js_error::type_error(ctx, "unknown Background kind")),
+    };
+    Ok(crate::spec::BackgroundSpec {
+        kind,
+        opacity: opacity as f32,
+    })
+}
+
+/// A value the prelude's `Background` builder made, if `object` is one.
+fn background_object(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+) -> JsResult<Option<crate::spec::BackgroundSpec>> {
+    if !matches!(
+        object.get::<_, Option<bool>>("__background"),
+        Ok(Some(true))
+    ) {
+        return Ok(None);
+    }
+    let kind: String = object.get("kind")?;
+    let values: Array<'_> = object.get("values")?;
+    let opacity: f64 = object.get("opacityFactor")?;
+    let color_space: String = object.get("colorSpace")?;
+    background_spec(ctx, &kind, &values, opacity, color_space).map(Some)
+}
+
+/// The shadow record fields `shadow([...])` reads, in the order the error
+/// lists them.
+const SHADOW_FIELDS: [&str; 6] = ["x", "y", "blur", "spread", "color", "inset"];
+
+/// Reads a `shadow([...])` argument: an array of CSS-like records.
+///
+/// The shape is checked here, where the script's own values are still in hand
+/// to name; the colours are checked by `style::apply_param`, which runs at the
+/// call site too. An unknown key is refused rather than ignored, because
+/// `offsetY` or `blurRadius` would otherwise draw a shadow with that part
+/// silently missing.
+fn shadow_list(ctx: &Ctx<'_>, array: &Array<'_>) -> JsResult<Vec<crate::spec::ShadowSpec>> {
+    let length = host_modules::bridge_array_len(ctx, array)?;
+    let mut shadows = Vec::with_capacity(length);
+    for index in 0..length {
+        let entry: Value<'_> = array.get(index)?;
+        let fail =
+            |message: String| js_error::type_error(ctx, &format!("shadow {index}: {message}"));
+        let object = entry
+            .as_object()
+            .filter(|_| entry.as_array().is_none() && entry.as_function().is_none())
+            .ok_or_else(|| {
+                fail("expected an object like { y: 1, blur: 2, color: \"#00000066\" }".into())
+            })?;
+        for key in object.keys::<String>() {
+            let key = key?;
+            if !SHADOW_FIELDS.contains(&key.as_str()) {
+                return Err(fail(format!(
+                    "unknown field `{key}`; a shadow takes {}",
+                    SHADOW_FIELDS.join(", ")
+                )));
+            }
+        }
+        let number = |field: &str, minimum: Option<f64>| -> JsResult<f32> {
+            let value: Value<'_> = object.get(field)?;
+            if value.is_undefined() {
+                return Ok(0.);
+            }
+            match value.as_number() {
+                Some(number) if number.is_finite() && minimum.is_none_or(|min| number >= min) => {
+                    Ok(number as f32)
+                }
+                _ => Err(fail(format!(
+                    "`{field}` must be a finite{} number of pixels",
+                    if minimum.is_some() {
+                        ", non-negative"
+                    } else {
+                        ""
+                    }
+                ))),
+            }
+        };
+        let x = number("x", None)?;
+        let y = number("y", None)?;
+        let blur = number("blur", Some(0.))?;
+        let spread = number("spread", None)?;
+        let color: Value<'_> = object.get("color")?;
+        let color = color
+            .as_string()
+            .map(|text| text.to_string())
+            .transpose()?
+            .ok_or_else(|| {
+                fail("`color` is required and must be a #rgb, #rrggbb or #rrggbbaa string".into())
+            })?;
+        let inset: Value<'_> = object.get("inset")?;
+        let inset = if inset.is_undefined() {
+            false
+        } else {
+            inset
+                .as_bool()
+                .ok_or_else(|| fail("`inset` must be a boolean".into()))?
+        };
+        shadows.push(crate::spec::ShadowSpec {
+            x,
+            y,
+            blur,
+            spread,
+            color,
+            inset,
+        });
+    }
+    Ok(shadows)
+}
+
+/// Converts the argument of the parametric style `name`.
+///
+/// [`bridge`] plus the one shape only a style can take: the array `shadow`
+/// reads. Every other style refuses an array by name, rather than having it
+/// misread as a shadow list.
+fn bridge_style<'js>(ctx: &Ctx<'js>, name: &str, value: &Value<'js>) -> JsResult<Bridged> {
+    if name == "shadow" {
+        if let Some(array) = value.as_array() {
+            return Ok(Bridged::Shadows(shadow_list(ctx, array)?));
+        }
+        // Most likely a single record passed without its array.
+        if value.as_object().is_some() {
+            return Err(js_error::type_error(
+                ctx,
+                "`shadow` expects an array of shadows; wrap a single one in [ ]: \
+                 shadow([{ y: 1, blur: 2, color: \"#00000066\" }])",
+            ));
+        }
+    } else if value.as_array().is_some() {
+        return Err(js_error::type_error(
+            ctx,
+            &format!("`{name}` does not take an array"),
+        ));
+    }
+    bridge(ctx, value)
+}
+
 /// Converts one non-function script value.
 ///
-/// The one place the four bridged cases are named, so that [`Arguments`] and
-/// [`StyleArgument`] cannot come to disagree about what a script value is.
+/// The one place the bridged cases are named, so that [`Arguments`] and
+/// [`StyleArgument`] cannot come to disagree about what a script value is. A
+/// `Background` from the prelude's builder is recognised here, wherever it is
+/// passed; the `shadow` list is read by [`bridge_style`], which knows the
+/// method.
 fn bridge(ctx: &Ctx<'_>, value: &Value<'_>) -> JsResult<Bridged> {
     Ok(if value.is_null() || value.is_undefined() {
         Bridged::Nil
@@ -9847,10 +10187,17 @@ fn bridge(ctx: &Ctx<'_>, value: &Value<'_>) -> JsResult<Bridged> {
         Bridged::Number(number)
     } else if let Some(text) = value.as_string() {
         Bridged::Str(text.to_string()?)
+    } else if let Some(background) = value
+        .as_object()
+        .map(|object| background_object(ctx, object))
+        .transpose()?
+        .flatten()
+    {
+        Bridged::Background(Box::new(background))
     } else {
-        return Err(Exception::throw_type(
+        return Err(js_error::type_error(
             ctx,
-            "unsupported argument type; expected null, boolean, number, string or function",
+            "unsupported argument type; expected null, boolean, number, string, Background or function",
         ));
     })
 }
@@ -9924,7 +10271,7 @@ impl<'js> FromJs<'js> for Arguments {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> JsResult<Self> {
         let array = value
             .into_array()
-            .ok_or_else(|| Exception::throw_type(ctx, "expected an argument list"))?;
+            .ok_or_else(|| js_error::type_error(ctx, "expected an argument list"))?;
 
         let length = host_modules::bridge_array_len(ctx, &array)?;
         let mut converted = SmallVec::with_capacity(length);
@@ -9957,16 +10304,16 @@ fn component_argument_from_js<'js>(
     budget: &mut ComponentArgumentBudget,
 ) -> JsResult<Argument> {
     if depth > MAX_COMPONENT_ARGUMENT_DEPTH {
-        return Err(Exception::throw_range(
+        return Err(js_error::range_error(
             ctx,
             "component arguments are nested too deeply",
         ));
     }
     budget.nodes = budget.nodes.checked_add(1).ok_or_else(|| {
-        Exception::throw_range(ctx, "component arguments contain too many nested values")
+        js_error::range_error(ctx, "component arguments contain too many nested values")
     })?;
     if budget.nodes > MAX_COMPONENT_ARGUMENT_NODES {
-        return Err(Exception::throw_range(
+        return Err(js_error::range_error(
             ctx,
             "component arguments contain too many nested values",
         ));
@@ -10101,6 +10448,7 @@ fn callback_op_name(method: &str) -> Option<&'static str> {
         "on_pinch" => "on_pinch",
         "on_item_click" => "on_item_click",
         "on_item_secondary_click" => "on_item_secondary_click",
+        "on_visible_range_change" => "on_visible_range_change",
         "on_resize" => "on_resize",
         "tab_bar" => "tab_bar",
         "empty_group" => "empty_group",
@@ -10208,7 +10556,7 @@ fn refuse_nested_view_mutation(ctx: &Ctx<'_>, api: &str, action: &str) -> JsResu
     let Some(phase @ (ScopePhase::Render | ScopePhase::Layout)) = scope::current_phase() else {
         return Ok(());
     };
-    Err(Exception::throw_type(
+    Err(js_error::type_error(
         ctx,
         &format!(
             "{api} cannot run during {}; {action} retained views from init(), an event handler \
@@ -10219,7 +10567,7 @@ fn refuse_nested_view_mutation(ctx: &Ctx<'_>, api: &str, action: &str) -> JsResu
 }
 
 fn nested_view_needs_call(ctx: &Ctx<'_>, api: &str) -> JsError {
-    Exception::throw_type(
+    js_error::type_error(
         ctx,
         &format!("{api} needs a live host call; use it from init(), an event handler or a task"),
     )
@@ -10228,7 +10576,7 @@ fn nested_view_needs_call(ctx: &Ctx<'_>, api: &str) -> JsError {
 fn upgrade(runtime: &Weak<ShellRuntime>, ctx: &Ctx<'_>) -> JsResult<Rc<ShellRuntime>> {
     runtime
         .upgrade()
-        .ok_or_else(|| Exception::throw_message(ctx, "the shell runtime has already shut down"))
+        .ok_or_else(|| js_error::error(ctx, "the shell runtime has already shut down"))
 }
 
 /// Turns a QuickJS error into a message that includes the script's own stack,
@@ -10249,14 +10597,16 @@ fn describe(ctx: &Ctx<'_>, error: JsError) -> String {
 fn describe_value<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> String {
     if let Some(exception) = value.as_exception() {
         let message = exception.message().unwrap_or_default();
-        let message = sandbox::explain_interruption(&message).unwrap_or_else(|| {
-            match exception.get::<_, Option<String>>("name").ok().flatten() {
-                Some(name) if message.is_empty() => name,
-                Some(name) if name != "Error" => format!("{name}: {message}"),
-                _ if message.is_empty() => "Error".to_owned(),
-                _ => message,
-            }
-        });
+        let message = sandbox::explain_interruption(&message)
+            .or_else(|| sandbox::explain_out_of_memory(ctx, Some(&message)))
+            .unwrap_or_else(
+                || match exception.get::<_, Option<String>>("name").ok().flatten() {
+                    Some(name) if message.is_empty() => name,
+                    Some(name) if name != "Error" => format!("{name}: {message}"),
+                    _ if message.is_empty() => "Error".to_owned(),
+                    _ => message,
+                },
+            );
         return match exception.stack() {
             Some(stack) if !stack.trim().is_empty() => {
                 format!("{message}\n{}", tidy_stack(&stack))
@@ -10267,6 +10617,12 @@ fn describe_value<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> String {
 
     if let Some(text) = value.as_string().and_then(|text| text.to_string().ok()) {
         return text;
+    }
+
+    if value.is_null()
+        && let Some(explained) = sandbox::explain_out_of_memory(ctx, None)
+    {
+        return explained;
     }
 
     if value.is_null() || value.is_undefined() {
@@ -10293,10 +10649,15 @@ fn describe_value<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> String {
 /// Module names carry a `?v=<generation>` tag the loader adds so an edited file
 /// re-evaluates; the author never wrote it and it means nothing to them. And
 /// recursion repeats one frame until the stack is mostly the same line, so a
-/// run of identical frames is shown once with its count.
+/// run of identical frames is shown once with its count. Frames in the
+/// runtime's own prelude, which rquickjs evaluates as `eval_script`, are the
+/// shell's builder plumbing rather than anything the author wrote, and go.
 fn tidy_stack(stack: &str) -> String {
     let mut frames: Vec<(String, usize)> = Vec::new();
-    for line in stack.lines().filter(|line| !line.trim().is_empty()) {
+    for line in stack
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.contains("(eval_script:"))
+    {
         let line = strip_generation_tags(line);
         match frames.last_mut() {
             Some((last, count)) if *last == line => *count += 1,
@@ -10340,7 +10701,8 @@ mod stack_tests {
 
     #[test]
     fn a_stack_drops_generation_tags_and_folds_recursion() {
-        let stack = "    at walk (/app/lib/scan.js?v=1:237:72)\n\
+        let stack = "    at <anonymous> (eval_script:36:15)\n\
+                     \x20   at walk (/app/lib/scan.js?v=1:237:72)\n\
                      \x20   at walk (/app/lib/scan.js?v=1:237:72)\n\
                      \x20   at walk (/app/lib/scan.js?v=1:237:72)\n\
                      \x20   at render (/app/main.js?v=12:870:21)\n";

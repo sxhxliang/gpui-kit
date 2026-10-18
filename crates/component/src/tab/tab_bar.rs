@@ -16,6 +16,7 @@ use super::{
 };
 use crate::button::{Button, ButtonVariants as _};
 use crate::menu::{DropdownMenu as _, PopupMenuItem};
+use crate::scroll::ScrollableMask;
 use crate::{
     ActiveTheme, ElementExt, Icon, InteractiveElementExt as _, Selectable, Sizable, Size,
     StyledExt, h_flex, styled::raised_shadow,
@@ -24,6 +25,9 @@ use crate::{
 struct TabIndicatorBounds {
     container: Bounds<Pixels>,
     tabs: Vec<Bounds<Pixels>>,
+    /// Where the last render placed the indicator: its left edge from the
+    /// first tab's, and its width (zero before the tabs were measured).
+    placed: (Pixels, Pixels),
 }
 
 impl TabIndicatorBounds {
@@ -31,6 +35,7 @@ impl TabIndicatorBounds {
         Self {
             container: Bounds::default(),
             tabs: vec![Bounds::default(); num_tabs],
+            placed: (px(0.), px(0.)),
         }
     }
 
@@ -227,6 +232,9 @@ impl TabBar {
         self.update_anim_params(selected_ix, bounds_rc, &prev_selected, &anim_params, cx);
 
         let (to_left, to_width, epoch) = *anim_params.read(cx);
+        if let Some(rc) = bounds_rc {
+            rc.borrow_mut().placed = (to_left, to_width);
+        }
         if to_width <= px(0.) {
             return None;
         }
@@ -477,6 +485,7 @@ impl RenderOnce for TabBar {
         let indicator_ready = indicator_element.is_some();
 
         let has_suffix_or_menu = self.suffix.is_some() || self.menu;
+        let view = window.current_view();
         let mut item_metas: Vec<(Option<SharedString>, Option<Icon>, bool)> = Vec::new();
         let selected_index = self.selected_index;
         let on_click = self.on_click.clone();
@@ -539,6 +548,7 @@ impl RenderOnce for TabBar {
 
             rendered_tabs.push(if let Some(ref rc) = bounds_rc {
                 let rc = rc.clone();
+                let selected = selected_index == Some(ix);
                 // `tabs-inner` is tracked by `ScrollHandle`, which indexes its
                 // direct children. Keep the indicator inside the first tab so
                 // only logical tabs occupy those indices.
@@ -549,9 +559,26 @@ impl RenderOnce for TabBar {
                         this.style().flex_basis = flex_basis;
                         this
                     })
-                    .on_prepaint(move |bounds, _, _| {
-                        if let Some(slot) = rc.borrow_mut().tabs.get_mut(ix) {
+                    .on_prepaint(move |bounds, window, _| {
+                        let mut measured = rc.borrow_mut();
+                        if let Some(slot) = measured.tabs.get_mut(ix) {
                             *slot = bounds;
+                        }
+                        // Render places the indicator from the bounds an
+                        // earlier frame measured, and a view that nothing
+                        // changed may not render again. When the selected tab
+                        // is measured elsewhere than its indicator (on the
+                        // bar's first frame above all), render the view again
+                        // on the next frame. Not while the bar has no width:
+                        // render leaves the indicator where it was then.
+                        if selected && measured.container.size.width > px(0.) {
+                            let first = measured
+                                .tabs
+                                .first()
+                                .map_or(bounds.origin.x, |tab| tab.origin.x);
+                            if (bounds.origin.x - first, bounds.size.width) != measured.placed {
+                                window.on_next_frame(move |_, cx| cx.notify(view));
+                            }
                         }
                     })
                     .relative()
@@ -651,7 +678,9 @@ impl RenderOnce for TabBar {
                             .track_scroll(&scroll_handle)
                             .children(rendered_tabs)
                             .when(has_suffix_or_menu, |this| this.child(self.last_empty_space)),
-                    ),
+                    )
+                    // Outside the tracked children so tab indices stay unchanged.
+                    .child(ScrollableMask::vertical_wheel(&scroll_handle)),
             )
             .when(self.menu, |this| {
                 this.child(
@@ -820,6 +849,7 @@ mod tests {
     use gpui::{Context, Modifiers, Render, TestAppContext};
 
     use super::*;
+    use crate::scroll::ScrollableElement as _;
 
     struct Harness {
         group_handler: bool,
@@ -1438,11 +1468,20 @@ mod tests {
         );
 
         // The user scrolls while the reveal is still travelling.
-        scroll_handle.set_offset(gpui::point(px(-10.), px(0.)));
+        wheel(
+            cx,
+            scroll_handle.bounds().center(),
+            gpui::ScrollDelta::Lines(point(0., 1.)),
+            gpui::TouchPhase::Moved,
+        );
+        let manual = scroll_handle.offset().x;
+        assert!(manual > moving);
+        let after_wheel = cx.debug_bounds("click-tab-1").unwrap();
         for _ in 0..30 {
             next_frame(cx);
         }
-        assert_eq!(scroll_handle.offset().x, px(-10.));
+        assert_eq!(scroll_handle.offset().x, manual);
+        assert_eq!(cx.debug_bounds("click-tab-1").unwrap(), after_wheel);
 
         // A new click travels all the way.
         cx.simulate_click(
@@ -1453,5 +1492,508 @@ mod tests {
             next_frame(cx);
         }
         assert_eq!(scroll_handle.offset().x, px(-52.));
+    }
+
+    struct WheelHarness {
+        scroll_handle: Option<ScrollHandle>,
+        variant: TabVariant,
+    }
+
+    fn wheel_tabs(handle: Option<&ScrollHandle>, variant: TabVariant, tabs: usize) -> TabBar {
+        TabBar::new("wheel-tabs")
+            .w_full()
+            .with_variant(variant)
+            .when_some(handle, |tabs, handle| tabs.track_scroll(handle))
+            .children((0..tabs).map(|ix| {
+                Tab::new()
+                    .w(px(60.))
+                    .label(format!("Tab {ix}"))
+                    .debug_selector(move || format!("wheel-tab-{ix}"))
+            }))
+    }
+
+    impl Render for WheelHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(160.))
+                .debug_selector(|| "wheel-bar".into())
+                .child(wheel_tabs(self.scroll_handle.as_ref(), self.variant, 6))
+        }
+    }
+
+    fn wheel(
+        cx: &mut gpui::VisualTestContext,
+        position: gpui::Point<Pixels>,
+        delta: gpui::ScrollDelta,
+        touch_phase: gpui::TouchPhase,
+    ) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta,
+            touch_phase,
+            ..Default::default()
+        });
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn vertical_mouse_wheel_scrolls_each_variant_with_and_without_a_tracked_handle(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::theme::init);
+        for variant in [
+            TabVariant::Tab,
+            TabVariant::Outline,
+            TabVariant::Segmented,
+            TabVariant::Pill,
+            TabVariant::Underline,
+            TabVariant::Folder,
+        ] {
+            for tracked in [false, true] {
+                let scroll_handle = tracked.then(ScrollHandle::new);
+                let (_, cx) = cx.add_window_view({
+                    let scroll_handle = scroll_handle.clone();
+                    move |_, _| WheelHarness {
+                        scroll_handle,
+                        variant,
+                    }
+                });
+                draw(cx);
+                draw(cx);
+                let bar = cx.debug_bounds("wheel-bar").unwrap();
+                let first_before = cx.debug_bounds("wheel-tab-0").unwrap();
+                let last_before = cx.debug_bounds("wheel-tab-5").unwrap();
+                assert!(
+                    last_before.left() > bar.right(),
+                    "{variant:?}, tracked: {tracked}"
+                );
+
+                wheel(
+                    cx,
+                    first_before.center(),
+                    gpui::ScrollDelta::Lines(point(0., -100.)),
+                    gpui::TouchPhase::Moved,
+                );
+                let first_after = cx.debug_bounds("wheel-tab-0").unwrap();
+                let last_after = cx.debug_bounds("wheel-tab-5").unwrap();
+                assert!(
+                    first_after.left() < first_before.left(),
+                    "{variant:?}, tracked: {tracked}, bar {bar:?}, first {first_before:?}, after {first_after:?}"
+                );
+                assert!(last_after.left() >= bar.left() && last_after.right() <= bar.right());
+                if let Some(handle) = &scroll_handle {
+                    assert_eq!(handle.offset().x, -handle.max_offset().x);
+                    assert_eq!(handle.offset().y, px(0.));
+                }
+
+                wheel(
+                    cx,
+                    first_before.center(),
+                    gpui::ScrollDelta::Lines(point(0., 100.)),
+                    gpui::TouchPhase::Moved,
+                );
+                assert_eq!(cx.debug_bounds("wheel-tab-0").unwrap(), first_before);
+                if let Some(handle) = &scroll_handle {
+                    assert_eq!(handle.offset(), point(px(0.), px(0.)));
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    enum WheelParent {
+        Div(ScrollHandle),
+        List(gpui::ListState),
+        Scrollable,
+    }
+
+    impl WheelParent {
+        fn offset(&self) -> Option<(usize, Pixels)> {
+            match self {
+                Self::Div(handle) => Some((0, -handle.offset().y)),
+                Self::List(state) => {
+                    let offset = state.logical_scroll_top();
+                    Some((offset.item_ix, offset.offset_in_item))
+                }
+                // Component Scrollable keeps its viewport handle private. Its
+                // actual movement is checked through the tab's rendered Y bound.
+                Self::Scrollable => None,
+            }
+        }
+    }
+
+    struct NestedWheelHarness {
+        parent: WheelParent,
+        scroll_handle: ScrollHandle,
+        tabs: usize,
+    }
+
+    impl Render for NestedWheelHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            match &self.parent {
+                WheelParent::Div(parent) => crate::v_flex()
+                    .id("wheel-parent")
+                    .w(px(160.))
+                    .h(px(100.))
+                    .overflow_y_scroll()
+                    .lock_scroll_axis()
+                    .track_scroll(parent)
+                    .child(div().w_full().h(px(60.)).flex_shrink_0().child(wheel_tabs(
+                        Some(&self.scroll_handle),
+                        TabVariant::Tab,
+                        self.tabs,
+                    )))
+                    .child(div().h(px(400.)).flex_shrink_0())
+                    .into_any_element(),
+                WheelParent::Scrollable => crate::v_flex()
+                    .w(px(160.))
+                    .h(px(100.))
+                    .child(div().w_full().h(px(60.)).flex_shrink_0().child(wheel_tabs(
+                        Some(&self.scroll_handle),
+                        TabVariant::Tab,
+                        self.tabs,
+                    )))
+                    .child(div().h(px(400.)).flex_shrink_0())
+                    .overflow_y_scrollbar()
+                    .into_any_element(),
+                WheelParent::List(parent) => {
+                    let handle = self.scroll_handle.clone();
+                    let tabs = self.tabs;
+                    div()
+                        .w(px(160.))
+                        .h(px(100.))
+                        .child(
+                            gpui::list(parent.clone(), move |ix, _, _| {
+                                if ix == 0 {
+                                    div()
+                                        .w_full()
+                                        .h(px(60.))
+                                        .child(wheel_tabs(Some(&handle), TabVariant::Tab, tabs))
+                                        .into_any_element()
+                                } else {
+                                    div().w_full().h(px(40.)).into_any_element()
+                                }
+                            })
+                            .w_full()
+                            .h_full(),
+                        )
+                        .into_any_element()
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn vertical_mouse_wheel_uses_tabs_before_scrolling_ancestors(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+        for parent_kind in 0..3 {
+            for (tabs, at_end) in [(6, false), (6, true), (1, false)] {
+                let scroll_handle = ScrollHandle::new();
+                let parent = match parent_kind {
+                    0 => WheelParent::Div(ScrollHandle::new()),
+                    1 => WheelParent::List(
+                        gpui::ListState::new(10, gpui::ListAlignment::Top, px(0.)).measure_all(),
+                    ),
+                    _ => WheelParent::Scrollable,
+                };
+                let (_, cx) = cx.add_window_view({
+                    let scroll_handle = scroll_handle.clone();
+                    let parent = parent.clone();
+                    move |_, _| NestedWheelHarness {
+                        parent,
+                        scroll_handle,
+                        tabs,
+                    }
+                });
+                draw(cx);
+                draw(cx);
+                if let WheelParent::List(state) = &parent {
+                    assert!(state.max_offset_for_scrollbar().y > px(0.));
+                }
+                if at_end {
+                    scroll_handle.set_offset(point(-scroll_handle.max_offset().x, px(0.)));
+                    draw(cx);
+                }
+                let before_x = scroll_handle.offset().x;
+                let first_before = cx.debug_bounds("wheel-tab-0").unwrap();
+                let position = scroll_handle.bounds().center();
+                assert_eq!(parent.offset().unwrap_or_default(), (0, px(0.)));
+                wheel(
+                    cx,
+                    position,
+                    gpui::ScrollDelta::Lines(point(0., -1.)),
+                    gpui::TouchPhase::Moved,
+                );
+                let first_after = cx.debug_bounds("wheel-tab-0").unwrap();
+                if tabs > 1 && !at_end {
+                    assert!(scroll_handle.offset().x < before_x);
+                    assert!(first_after.left() < first_before.left());
+                    assert_eq!(parent.offset().unwrap_or_default(), (0, px(0.)));
+                    assert_eq!(first_after.top(), first_before.top());
+                } else {
+                    assert_eq!(scroll_handle.offset().x, before_x);
+                    if let Some(offset) = parent.offset() {
+                        assert_ne!(
+                            offset,
+                            (0, px(0.)),
+                            "parent {parent_kind}, tabs {tabs}, at_end {at_end}, before_x {before_x:?}, first_before {first_before:?}, after {first_after:?}"
+                        );
+                    }
+                    assert!(first_after.top() < first_before.top());
+                }
+            }
+        }
+    }
+
+    struct WheelLineHeightHarness {
+        scroll_handle: ScrollHandle,
+        font_size: Pixels,
+        line_height: Pixels,
+    }
+
+    impl Render for WheelLineHeightHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // The scroll viewport inherits these values. Tab's own label styling
+            // is below that viewport and must not determine its wheel distance.
+            div()
+                .w(px(160.))
+                .h(px(64.))
+                .text_size(self.font_size)
+                .line_height(self.line_height)
+                .child(wheel_tabs(Some(&self.scroll_handle), TabVariant::Tab, 6))
+        }
+    }
+
+    #[gpui::test]
+    fn vertical_mouse_wheel_uses_the_scroll_viewports_inherited_line_height(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::theme::init);
+        for (font_size, line_height) in [(px(12.), px(18.)), (px(24.), px(48.))] {
+            let scroll_handle = ScrollHandle::new();
+            let (_, cx) = cx.add_window_view({
+                let scroll_handle = scroll_handle.clone();
+                move |_, _| WheelLineHeightHarness {
+                    scroll_handle,
+                    font_size,
+                    line_height,
+                }
+            });
+            draw(cx);
+            draw(cx);
+            let first_before = cx.debug_bounds("wheel-tab-0").unwrap();
+            assert!(scroll_handle.max_offset().x > line_height);
+            assert_eq!(scroll_handle.offset(), point(px(0.), px(0.)));
+
+            // Use actual tab geometry: a wrapping div can have zero auto height
+            // while its overflowing children still paint and accept input.
+            let position = first_before.center();
+            wheel(
+                cx,
+                position,
+                gpui::ScrollDelta::Lines(point(0., -1.)),
+                gpui::TouchPhase::Moved,
+            );
+            assert_eq!(
+                scroll_handle.offset(),
+                point(-line_height, px(0.)),
+                "font {font_size:?}, line height {line_height:?}"
+            );
+            let first_after = cx.debug_bounds("wheel-tab-0").unwrap();
+            assert_eq!(first_after.left() - first_before.left(), -line_height);
+            assert_eq!(first_after.top(), first_before.top());
+
+            wheel(
+                cx,
+                position,
+                gpui::ScrollDelta::Lines(point(0., 1.)),
+                gpui::TouchPhase::Moved,
+            );
+            assert_eq!(scroll_handle.offset(), point(px(0.), px(0.)));
+            assert_eq!(cx.debug_bounds("wheel-tab-0").unwrap(), first_before);
+        }
+    }
+
+    struct WheelHitboxHarness {
+        scroll_handle: ScrollHandle,
+        occluded: bool,
+    }
+
+    impl Render for WheelHitboxHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .w(px(240.))
+                .h(px(64.))
+                .child(
+                    wheel_tabs(Some(&self.scroll_handle), TabVariant::Tab, 6)
+                        .prefix(
+                            div()
+                                .w(px(40.))
+                                .h(px(32.))
+                                .debug_selector(|| "wheel-prefix".into())
+                                .child("P"),
+                        )
+                        .suffix(
+                            div()
+                                .w(px(40.))
+                                .h(px(32.))
+                                .debug_selector(|| "wheel-suffix".into())
+                                .child("S"),
+                        ),
+                )
+                .when(self.occluded, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .debug_selector(|| "wheel-occluder".into()),
+                    )
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn vertical_mouse_wheel_respects_the_viewport_and_occluding_surfaces(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+        let scroll_handle = ScrollHandle::new();
+        let (view, cx) = cx.add_window_view({
+            let scroll_handle = scroll_handle.clone();
+            move |_, _| WheelHitboxHarness {
+                scroll_handle,
+                occluded: false,
+            }
+        });
+        draw(cx);
+        draw(cx);
+        let first_before = cx.debug_bounds("wheel-tab-0").unwrap();
+        assert!(scroll_handle.max_offset().x > px(0.));
+        assert_eq!(scroll_handle.offset(), point(px(0.), px(0.)));
+
+        for selector in ["wheel-prefix", "wheel-suffix"] {
+            let position = cx.debug_bounds(selector).unwrap().center();
+            assert!(!scroll_handle.bounds().contains(&position));
+            wheel(
+                cx,
+                position,
+                gpui::ScrollDelta::Lines(point(0., -1.)),
+                gpui::TouchPhase::Moved,
+            );
+            assert_eq!(scroll_handle.offset(), point(px(0.), px(0.)));
+            assert_eq!(cx.debug_bounds("wheel-tab-0").unwrap(), first_before);
+        }
+
+        view.update(cx, |view, cx| {
+            view.occluded = true;
+            cx.notify();
+        });
+        draw(cx);
+        let position = scroll_handle.bounds().center();
+        let occluder = cx.debug_bounds("wheel-occluder").unwrap();
+        assert!(occluder.size.width > px(0.) && occluder.size.height > px(0.));
+        assert!(occluder.contains(&position));
+        wheel(
+            cx,
+            position,
+            gpui::ScrollDelta::Lines(point(0., -1.)),
+            gpui::TouchPhase::Moved,
+        );
+        assert_eq!(scroll_handle.offset(), point(px(0.), px(0.)));
+        assert_eq!(cx.debug_bounds("wheel-tab-0").unwrap(), first_before);
+
+        view.update(cx, |view, cx| {
+            view.occluded = false;
+            cx.notify();
+        });
+        draw(cx);
+        wheel(
+            cx,
+            position,
+            gpui::ScrollDelta::Lines(point(0., -1.)),
+            gpui::TouchPhase::Moved,
+        );
+        assert!(scroll_handle.offset().x < px(0.));
+        let first_after = cx.debug_bounds("wheel-tab-0").unwrap();
+        assert!(first_after.left() < first_before.left());
+        assert_eq!(first_after.top(), first_before.top());
+    }
+
+    /// A bar of two underlined tabs, the first selected, in a box `width`
+    /// wide, which the view shows once `shown`.
+    struct LateBar {
+        shown: bool,
+        width: Pixels,
+    }
+
+    impl Render for LateBar {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(self.width)
+                .overflow_hidden()
+                .when(self.shown, |this| {
+                    this.child(
+                        TabBar::new("late-tabs")
+                            .underline()
+                            .selected_index(0)
+                            .child(Tab::new().label("First"))
+                            .child(Tab::new().label("Second")),
+                    )
+                })
+        }
+    }
+
+    /// Shows a bar in a window drawn before, as a view shows one once its
+    /// data came, and draws the bar's first frame.
+    fn show_late_bar(cx: &mut TestAppContext, width: Pixels) -> &mut gpui::VisualTestContext {
+        cx.update(crate::theme::init);
+        let (view, cx) = cx.add_window_view(move |_, _| LateBar {
+            shown: false,
+            width,
+        });
+        draw(cx);
+        view.update(cx, |bar, cx| {
+            bar.shown = true;
+            cx.notify();
+        });
+        draw(cx);
+        cx
+    }
+
+    /// The underline indicators the frame drawn last painted.
+    fn painted_indicators(cx: &mut gpui::VisualTestContext) -> Vec<Bounds<Pixels>> {
+        cx.update(|window, cx| {
+            let primary: Background = cx.theme().tokens.primary.into();
+            let scale_factor = window.scale_factor();
+            window
+                .painted_quads()
+                .into_iter()
+                .filter(|quad| quad.background == primary)
+                .map(|quad| quad.bounds.map(|value| px(value.0 / scale_factor)))
+                .filter(|bounds| bounds.size.height == px(2.))
+                .collect()
+        })
+    }
+
+    /// The frame after a bar's first, which measured its tabs, draws the
+    /// indicator under the selected tab, though nothing the view holding
+    /// the bar renders from changed. Then the bar asks for no more frames.
+    #[gpui::test]
+    fn a_bar_shown_later_draws_its_indicator_on_the_next_frame(cx: &mut TestAppContext) {
+        let cx = show_late_bar(cx, px(300.));
+        next_frame(cx);
+        let indicators = painted_indicators(cx);
+        assert_eq!(indicators.len(), 1, "{indicators:?}");
+        assert!(indicators[0].size.width > px(0.), "{indicators:?}");
+        assert!(indicators[0].right() <= px(150.), "{indicators:?}");
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+    }
+
+    /// A bar squeezed to no width asks for no frames to place its indicator.
+    #[gpui::test]
+    fn a_bar_with_no_width_asks_for_no_frames(cx: &mut TestAppContext) {
+        let cx = show_late_bar(cx, px(0.));
+        next_frame(cx);
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
     }
 }
