@@ -35,7 +35,10 @@
 //! The state defaults to the [`DARK`] palette and the editor paints no
 //! background of its own, so set the palette for your color scheme with
 //! `set_theme` at creation (and when it changes) — otherwise dark-palette
-//! text sits unreadable on a light window.
+//! text sits unreadable on a light window. Likewise `set_fonts` to
+//! families your app actually has: the defaults are abstract's bundled
+//! Noto pair, and where they are missing the fallback face loses
+//! bold/italic traits, so emphasis silently renders as regular text.
 //!
 //! Configuration lives on the state: `set_theme`, `set_fonts`,
 //! `set_text_width` (via `set_max_col`), `set_smart_quotes`,

@@ -6,7 +6,7 @@ use gpui_kit::{
 };
 
 use gpui_kit::component::{ActiveTheme, Theme, label::Label, v_flex};
-use gpui_markdown_editor::{Changed, MarkdownEditor, MarkdownEditorState, DARK, LIGHT};
+use gpui_markdown_editor::{Changed, Fonts, MarkdownEditor, MarkdownEditorState, DARK, LIGHT};
 
 const SAMPLE: &str = "\
 # Markdown Editor
@@ -96,6 +96,16 @@ fn palette(cx: &App) -> gpui_markdown_editor::Palette {
     if cx.theme().mode.is_dark() { DARK } else { LIGHT }
 }
 
+/// The editor typefaces: the app theme's own families. The editor's
+/// defaults are abstract's bundled Noto pair; where those families are
+/// not installed (stock macOS/Windows), the text system falls back to a
+/// face without bold/italic traits and emphasis silently renders as
+/// regular text.
+fn fonts(cx: &App) -> Fonts {
+    let theme = cx.theme();
+    Fonts::new(theme.font_family.clone(), theme.mono_font_family.clone())
+}
+
 impl super::Story for MarkdownEditorStory {
     fn title() -> &'static str {
         "Markdown Editor"
@@ -122,9 +132,11 @@ impl MarkdownEditorStory {
             gpui_markdown_editor::bind_keys(cx);
         }
         let pal = palette(cx);
+        let f = fonts(cx);
         let state = cx.new(|cx| {
             let mut ed = MarkdownEditorState::new(cx);
             ed.set_theme(pal, cx);
+            ed.set_fonts(f, cx);
             ed.set_text(SAMPLE.to_string(), cx);
             ed
         });
@@ -136,7 +148,11 @@ impl MarkdownEditorStory {
         });
         let _theme_subscription = cx.observe_global::<Theme>(|this, cx| {
             let pal = palette(cx);
-            this.state.update(cx, |ed, cx| ed.set_theme(pal, cx));
+            let f = fonts(cx);
+            this.state.update(cx, |ed, cx| {
+                ed.set_theme(pal, cx);
+                ed.set_fonts(f, cx);
+            });
         });
         Self {
             state,
