@@ -15,7 +15,6 @@ default = ["tree-sitter"]
 anyhow.workspace = true
 gpui-kit = { workspace = true, features = ["speech"] }
 gpui-fps.workspace = true
-gpui-markdown-editor.workspace = true
 
 async-channel = "2.3.1"
 autocorrect = "2.14.2"
