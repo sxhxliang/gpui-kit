@@ -1793,6 +1793,8 @@ struct GridCell {
     /// Buffer range of the trimmed cell content.
     range: Range<usize>,
     segs: Vec<Seg>,
+    /// Inline-math figures to draw over their NBSP placeholders.
+    figs: Vec<(Range<usize>, Arc<render::Figure>)>,
     wrapped: WrappedLine,
     /// Text origin and wrap width, content coordinates.
     x: f32,
@@ -1827,6 +1829,7 @@ enum Planned {
 struct PlannedCell {
     range: Range<usize>,
     segs: Vec<Seg>,
+    figs: Vec<(Range<usize>, Arc<render::Figure>)>,
     wrapped: WrappedLine,
     dx: f32,
     w: f32,
@@ -1928,6 +1931,7 @@ fn plan_grid(
     style: &RunStyle,
     avail: f32,
     window: &mut Window,
+    fig_cache: &RefCell<HashMap<u64, Option<Arc<render::Figure>>>>,
 ) -> Option<Vec<(usize, Planned)>> {
     if t.len() < 2 {
         return None;
@@ -1939,6 +1943,31 @@ fn plan_grid(
     {
         return None;
     }
+    // Inline math inside cells typesets like prose math: probe the NBSP
+    // width at the grid's font size once for the whole table (the probe
+    // run matches the placeholder runs built below, `math: true`).
+    let grid_fs = GRID_FS * factor();
+    let scale = window.scale_factor();
+    let nbsp_w = if a
+        .maths_overlapping(&(first.start..last.end))
+        .iter()
+        .any(|m| !m.block)
+    {
+        window
+            .text_system()
+            .shape_text(
+                SharedString::from(NBSP),
+                px(grid_fs),
+                &[run(style, Kind::Body, 0, None, NBSP.len(), None, true, false)],
+                None,
+                None,
+            )
+            .ok()
+            .and_then(|mut v| v.pop())
+            .map_or(0., |l| f32::from(l.width()))
+    } else {
+        0.
+    };
     let aligns = pipe::aligns(&text[span(t.start + 1)]);
     let ncols = pipe::cell_spans(&text[first]).len().max(1);
     let mut rows = Vec::with_capacity(t.len() - 1);
@@ -1955,17 +1984,61 @@ fn plan_grid(
                 let range = spans.get(c).map_or(line.end..line.end, |r| {
                     line.start + r.start..line.start + r.end
                 });
-                let mut segs: Vec<Seg> = visible
+                let plain: Vec<Seg> = visible
                     .iter()
                     .map(|s| Seg::plain(s.start.max(range.start)..s.end.min(range.end)))
                     .filter(|s| s.buf.start < s.buf.end)
                     .collect();
+                // Untouched inline math becomes a figure over an NBSP
+                // placeholder, exactly as in prose lines; a span the
+                // selection touches (or one crossing the cell edge) falls
+                // back to the Unicode approximation inside push_math_segs.
+                let mut segs: Vec<Seg> = Vec::new();
+                let mut figs: Vec<(Range<usize>, Arc<render::Figure>)> = Vec::new();
+                if nbsp_w > 0. {
+                    for s in &plain {
+                        let mut ctx = InlineFigs {
+                            cache: fig_cache,
+                            fg: style.pal.fg,
+                            em_pt: grid_fs,
+                            scale,
+                            nbsp_w,
+                            placed: &mut figs,
+                        };
+                        push_math_segs(
+                            &mut segs,
+                            s.buf.clone(),
+                            a,
+                            reveal,
+                            text,
+                            Some(&mut ctx),
+                        );
+                    }
+                } else {
+                    segs = plain;
+                }
                 if segs.is_empty() {
                     segs.push(Seg::plain(range.start..range.start));
                 }
                 let mut display = String::new();
                 let mut runs = Vec::new();
                 for s in &segs {
+                    if let Some(repl) = &s.repl {
+                        let f = a.flags[s.buf.start];
+                        let f = if header { f | md::BOLD } else { f };
+                        runs.push(run(
+                            style,
+                            Kind::Body,
+                            f,
+                            None,
+                            repl.len(),
+                            None,
+                            true,
+                            false,
+                        ));
+                        display.push_str(repl);
+                        continue;
+                    }
                     let mut i = s.buf.start;
                     while i < s.buf.end {
                         let f = a.flags[i];
@@ -1990,7 +2063,7 @@ fn plan_grid(
                 }
                 style.dim_runs(&line, &mut runs);
                 let wrapped = shape_cell(window, &display, &runs, None);
-                (range, segs, display, runs, wrapped)
+                (range, segs, display, runs, wrapped, figs)
             })
             .collect();
         rows.push((ix, cells));
@@ -2023,7 +2096,7 @@ fn plan_grid(
             .zip(&cols)
             .enumerate()
             .map(
-                |(c, ((range, segs, display, runs, mut wrapped), &(_, w)))| {
+                |(c, ((range, segs, display, runs, mut wrapped, figs), &(_, w)))| {
                     let inner = w - GRID_PAD_X * zf * 2.;
                     if f32::from(wrapped.width()) > inner + 0.5 {
                         wrapped = shape_cell(window, &display, &runs, Some(inner));
@@ -2042,6 +2115,7 @@ fn plan_grid(
                     PlannedCell {
                         range,
                         segs,
+                        figs,
                         wrapped,
                         dx,
                         w: inner,
@@ -2712,7 +2786,7 @@ impl Element for EditorElement {
         let mut grid_plan: HashMap<usize, Planned> = HashMap::new();
         if !ed.raw_tables {
             for t in &a.tables {
-                if let Some(rows) = plan_grid(t, text, a, &reveal, &style, col_w, window) {
+                if let Some(rows) = plan_grid(t, text, a, &reveal, &style, col_w, window, &ed.fig_cache) {
                     grid_plan.extend(rows);
                 }
             }
@@ -2894,6 +2968,7 @@ impl Element for EditorElement {
                             .map(|(c, &(cx, _))| GridCell {
                                 range: c.range,
                                 segs: c.segs,
+                                figs: c.figs,
                                 wrapped: c.wrapped,
                                 x: x + cx + GRID_PAD_X * zf + c.dx,
                                 top: top + GRID_PAD_Y * zf,
@@ -3516,6 +3591,28 @@ impl Element for EditorElement {
                     c.wrapped
                         .paint(o, px(line.lh), TextAlign::Left, None, window, cx)
                         .ok();
+                    // Inline-math figures draw over their placeholders,
+                    // capped at the row's line height (grid rows do not
+                    // grow for a tall formula the way prose lines do).
+                    for (r, fig) in &c.figs {
+                        let d0 = seg_to_display(&c.segs, r.start);
+                        let p = c
+                            .wrapped
+                            .position_for_index(d0, px(line.lh))
+                            .unwrap_or_default();
+                        let k = (line.lh / fig.height.max(1.)).min(1.);
+                        let (w, h) = (fig.width * k, fig.height * k);
+                        let b = Bounds::new(
+                            at(
+                                c.x + f32::from(p.x),
+                                c.top + f32::from(p.y) + (line.lh - h) / 2. + line.lh * 0.08,
+                            ),
+                            size(px(w), px(h)),
+                        );
+                        window
+                            .paint_image(b, b, Corners::all(z(6.)), fig.image.clone(), 0, false)
+                            .ok();
+                    }
                 }
                 for (img, b) in &line.images {
                     let r = Bounds::new(

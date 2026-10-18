@@ -35,7 +35,7 @@ fn inline_math_document_draws(cx: &mut TestAppContext) {
                  $x^2$ at the start of a line, and a table cell:\n\n\
                  | Cell | Note |\n\
                  | ---- | ---- |\n\
-                 | $a^2 + b^2 = c^2$ | done |\n"
+                 | $a^2 + b^2 = c^2$ and $\\frac{1}{2}$ | done |\n"
                     .to_string(),
                 cx,
             );
