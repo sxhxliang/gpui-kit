@@ -89,6 +89,11 @@ impl MarkdownEditor {
 
 impl RenderOnce for MarkdownEditor {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        EditorElement::new(self.state)
+        // Render the state entity itself, not the bare `EditorElement`:
+        // `LiveEditor::render` supplies the interactive shell (focus
+        // tracking, the `LiveEditor` key context, every editing action,
+        // mouse and scroll handling, the context menu) around the element.
+        // The element alone paints the document but accepts no input.
+        self.state
     }
 }
