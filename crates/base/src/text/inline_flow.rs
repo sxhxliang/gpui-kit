@@ -15,6 +15,7 @@ use gpui::{
     size,
 };
 
+use super::state::ParagraphRows;
 use crate::text::text_view::{LinkClickHandlerFn, handle_link_click};
 
 use super::{
@@ -208,6 +209,41 @@ enum PositionedFragment {
         origin: gpui::Point<Pixels>,
         size: Size<Pixels>,
     },
+}
+
+/// The union of the flow's rows, in window coordinates, spanning the flow's
+/// width, with the heights of its first and last rows.
+fn paragraph_rows(fragments: &[PositionedFragment], bounds: Bounds<Pixels>) -> ParagraphRows {
+    let rows = fragments.iter().filter_map(|fragment| match fragment {
+        PositionedFragment::Object {
+            selection_bounds, ..
+        }
+        | PositionedFragment::Text {
+            selection_bounds, ..
+        } => Some(*selection_bounds),
+        PositionedFragment::Image { .. } => None,
+    });
+    let mut first: Option<Bounds<Pixels>> = None;
+    let mut last: Option<Bounds<Pixels>> = None;
+    for row in rows {
+        if first.is_none_or(|first| row.top() < first.top()) {
+            first = Some(row);
+        }
+        if last.is_none_or(|last| row.bottom() > last.bottom()) {
+            last = Some(row);
+        }
+    }
+    let (Some(first), Some(last)) = (first, last) else {
+        return ParagraphRows::single(bounds);
+    };
+    ParagraphRows {
+        bounds: Bounds::from_corners(
+            point(bounds.left(), bounds.top() + first.top()),
+            point(bounds.right(), bounds.top() + last.bottom()),
+        ),
+        first_row_height: first.size.height,
+        last_row_height: last.size.height,
+    }
 }
 
 enum MeasureItem {
@@ -568,6 +604,9 @@ impl Element for InlineFlow {
             overlays
         };
 
+        // A triple click anywhere in the flow selects the whole paragraph,
+        // every row of it, as it does in a paragraph of plain text.
+        let paragraph_rows = paragraph_rows(&layout.fragments, bounds);
         let mut text_fragment_count = 0;
         for (fragment_ix, fragment) in layout.fragments.iter().enumerate() {
             match fragment {
@@ -601,10 +640,7 @@ impl Element for InlineFlow {
                             bounds.origin + selection_bounds.origin,
                             selection_bounds.size,
                         ),
-                        Bounds::new(
-                            point(bounds.left(), bounds.top() + selection_bounds.top()),
-                            size(bounds.size.width, selection_bounds.size.height),
-                        ),
+                        paragraph_rows,
                     )
                     .link(link.clone(), self.link_click_handler.clone())
                     .into_any_element();
@@ -693,6 +729,7 @@ impl Element for InlineFlow {
                             point(bounds.left(), bounds.top() + selection_bounds.top()),
                             size(bounds.size.width, selection_bounds.size.height),
                         ))
+                        .paragraph_rows(paragraph_rows)
                         .paint_origin(bounds.origin + origin + point(insets.left, insets.top))
                         .into_any_element();
                     // The `Inline` is its own layout root, with no box around
@@ -1039,7 +1076,14 @@ fn layout_measured_flow(
             })
         })
         .collect::<Vec<_>>();
-    let line_ranges = line_ranges(items, &image_sizes, &objects, text_style, wrap_width, window);
+    let line_ranges = line_ranges(
+        items,
+        &image_sizes,
+        &objects,
+        text_style,
+        wrap_width,
+        window,
+    );
     let font_size = text_style.font_size.to_pixels(rem_size);
     let mut fragments = Vec::new();
     let mut empty_lines = Vec::new();
@@ -2010,8 +2054,8 @@ mod tests {
 
     #[test]
     fn inline_image_wider_than_the_wrap_is_narrowed_to_it() {
-        use gpui::{AbsoluteLength, Empty, TestApp};
         use super::super::inline::test_fonts::{BODY, WideMonoTextSystem};
+        use gpui::{AbsoluteLength, Empty, TestApp};
 
         let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
         let mut window = app.open_window(|_, _| Empty);
@@ -2078,7 +2122,7 @@ mod tests {
         };
         let items = vec![
             MeasureItem::Text {
-                text: lead.clone(),
+                text: lead,
                 links: vec![],
                 highlights: vec![],
             },
@@ -2090,7 +2134,7 @@ mod tests {
             MeasureItem::Text {
                 text: SharedString::from(tail_text),
                 links: vec![],
-                highlights: vec![(code_range.clone(), code_highlight)],
+                highlights: vec![(code_range, code_highlight)],
             },
         ];
         let image_size = size(px(10.), px(10.));
